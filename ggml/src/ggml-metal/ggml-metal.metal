@@ -10733,3 +10733,107 @@ kernel void kernel_count_equal(
 typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
+
+// Stage-1 diffusion sampler (DiffusionGemma entropy-bound decoder): one threadgroup of 256 threads per
+// canvas row. Mirrors ggml-cuda/diffusion-sampling.cu: parallel max->argmax, parallel Z and T (T = sum d*e),
+// entropy = logZ - T/Z, then a slice-scanned multinomial first-crossing walk in vocab order. Only the
+// reduction order differs from the host worker, so argmax is exact and Z/entropy match to FP tolerance.
+kernel void kernel_diffusion_dense_sample_f32(
+        device const float   * logits    [[buffer(0)]],
+        device const float   * u         [[buffer(1)]],
+        device       int32_t * argmax_o  [[buffer(2)]],
+        device       float   * entropy_o [[buffer(3)]],
+        device       int32_t * sampled_o [[buffer(4)]],
+        constant     int32_t & n_vocab   [[buffer(5)]],
+        constant     float   & inv_temp  [[buffer(6)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    threadgroup float   s_val[256];
+    threadgroup float   s_sum[256];
+    threadgroup int32_t s_idx[256];
+    threadgroup int32_t s_tok;
+
+    device const float * row_logits = logits + (ulong) row * (ulong) n_vocab;
+
+    float   local_max = -INFINITY;
+    int32_t local_idx = 0;
+    for (int v = (int) tid; v < n_vocab; v += (int) ntg) {
+        const float x = row_logits[v] * inv_temp;
+        if (x > local_max) { local_max = x; local_idx = v; }
+    }
+    s_val[tid] = local_max;
+    s_idx[tid] = local_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && s_val[tid + stride] > s_val[tid]) {
+            s_val[tid] = s_val[tid + stride];
+            s_idx[tid] = s_idx[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float   max_l = s_val[0];
+    const int32_t amax  = s_idx[0];
+
+    float local_sum = 0.0f;
+    float local_t   = 0.0f;
+    for (int v = (int) tid; v < n_vocab; v += (int) ntg) {
+        const float d = row_logits[v] * inv_temp - max_l;
+        const float e = exp(d);
+        local_sum += e;
+        local_t   += d * e;
+    }
+    s_sum[tid] = local_sum;
+    s_val[tid] = local_t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+            s_val[tid] += s_val[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float z = s_sum[0];
+    const float t = s_val[0];
+    if (tid == 0) {
+        argmax_o[row]  = amax;
+        entropy_o[row] = log(z) - t / z;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // multinomial draw (first v with cumulative exp(d) >= r, in vocab order): per-thread contiguous slice
+    // sums, exclusive scan on thread 0 to find the crossing slice, only that thread walks its slice.
+    const float r     = u[row] * z;
+    const int   chunk = (n_vocab + (int) ntg - 1) / (int) ntg;
+    const int   beg   = (int) tid * chunk;
+    const int   end   = min(beg + chunk, n_vocab);
+
+    float slice_sum = 0.0f;
+    for (int v = beg; v < end; ++v) {
+        slice_sum += exp(row_logits[v] * inv_temp - max_l);
+    }
+    s_sum[tid] = slice_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        s_tok    = n_vocab - 1;                 // host default if cum never reaches r (FP guard)
+        s_idx[0] = -1;                          // no crossing slice -> no thread walks, default stands
+        float pref = 0.0f;
+        for (uint i = 0; i < ntg; ++i) {        // exclusive scan + locate the crossing slice
+            const float next = pref + s_sum[i];
+            if (next >= r) { s_idx[0] = (int) i; s_val[0] = pref; break; }
+            pref = next;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((int) tid == s_idx[0]) {                // only the crossing thread walks its slice from its prefix
+        float cum = s_val[0];
+        for (int v = beg; v < end; ++v) {
+            cum += exp(row_logits[v] * inv_temp - max_l);
+            if (cum >= r) { s_tok = v; break; }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { sampled_o[row] = s_tok; }
+}

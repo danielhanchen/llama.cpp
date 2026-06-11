@@ -1877,3 +1877,107 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
     return res;
 }
+
+// Stage-1 diffusion sampler over a device-resident logits tensor (DiffusionGemma entropy-bound decoder).
+// Synchronous one-shot dispatch on the device queue; outputs land in the host arrays. Grow-only shared
+// scratch (u in; argmax/entropy/sampled out) mirrors the CUDA implementation's cached per-device scratch.
+bool ggml_metal_device_diffusion_sample(ggml_metal_device_t dev, struct ggml_tensor * logits,
+        const float * u, int * argmax, float * entropy, int * sampled, int n_tokens, float inv_temp) {
+    if (!dev || !logits || !u || !argmax || !entropy || !sampled || n_tokens <= 0) {
+        return false;
+    }
+    if (logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) || logits->buffer == NULL) {
+        return false;
+    }
+    const int32_t n_vocab = (int32_t) logits->ne[0];
+    if (n_vocab <= 0 || (int) ggml_nrows(logits) < n_tokens) {
+        return false;
+    }
+
+    ggml_metal_library_t lib = ggml_metal_device_get_library(dev);
+    if (!lib) {
+        return false;
+    }
+    struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(
+            lib, "kernel_diffusion_dense_sample_f32", "kernel_diffusion_dense_sample_f32", NULL);
+    if (!ppl.pipeline) {
+        return false;
+    }
+
+    struct ggml_metal_buffer_id bid =
+        ggml_metal_buffer_get_id((ggml_metal_buffer_t) logits->buffer->context, logits);
+    if (!bid.metal) {
+        return false;
+    }
+
+    static id<MTLBuffer>   g_dg_scratch      = nil;
+    static int             g_dg_scratch_cap  = 0;  // tokens
+    static size_t          g_dg_scratch_sec  = 0;  // bytes per section (u/argmax/entropy/sampled)
+    static NSLock        * g_dg_scratch_lock = nil;
+    static dispatch_once_t g_dg_scratch_once;
+    dispatch_once(&g_dg_scratch_once, ^{ g_dg_scratch_lock = [[NSLock alloc] init]; });
+
+    [g_dg_scratch_lock lock];
+
+    bool ok = false;
+
+    @autoreleasepool {
+        if (g_dg_scratch_cap < n_tokens) {
+            if (g_dg_scratch) {
+                [g_dg_scratch release];
+                g_dg_scratch = nil;
+            }
+            id<MTLDevice> mtl_dev = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+            const size_t sec = ((size_t) n_tokens * sizeof(float) + 255) & ~(size_t) 255;
+            g_dg_scratch = [mtl_dev newBufferWithLength:4*sec options:MTLResourceStorageModeShared];
+            if (!g_dg_scratch) {
+                [g_dg_scratch_lock unlock];
+                return false;
+            }
+            g_dg_scratch_cap = n_tokens;
+            g_dg_scratch_sec = sec;
+        }
+
+        const size_t sec  = g_dg_scratch_sec;
+        char       * base = (char *) [g_dg_scratch contents];
+
+        memcpy(base, u, (size_t) n_tokens * sizeof(float));
+
+        id<MTLCommandQueue>  queue = (id<MTLCommandQueue>) ggml_metal_device_get_queue(dev);
+        id<MTLCommandBuffer> cb    = [queue commandBuffer];
+
+        ggml_metal_encoder_t enc = ggml_metal_encoder_init((ggml_metal_cmd_buf_t) cb, false);
+
+        struct ggml_metal_buffer_id bid_u       = { (void *) g_dg_scratch, 0*sec };
+        struct ggml_metal_buffer_id bid_argmax  = { (void *) g_dg_scratch, 1*sec };
+        struct ggml_metal_buffer_id bid_entropy = { (void *) g_dg_scratch, 2*sec };
+        struct ggml_metal_buffer_id bid_sampled = { (void *) g_dg_scratch, 3*sec };
+
+        ggml_metal_encoder_set_pipeline(enc, ppl);
+        ggml_metal_encoder_set_buffer  (enc, bid,         0);
+        ggml_metal_encoder_set_buffer  (enc, bid_u,       1);
+        ggml_metal_encoder_set_buffer  (enc, bid_argmax,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_entropy, 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_sampled, 4);
+        ggml_metal_encoder_set_bytes   (enc, (void *) &n_vocab,  sizeof(n_vocab),  5);
+        ggml_metal_encoder_set_bytes   (enc, (void *) &inv_temp, sizeof(inv_temp), 6);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, 1, 1, 256, 1, 1);
+        ggml_metal_encoder_end_encoding(enc);
+        ggml_metal_encoder_free(enc);
+
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if ([cb status] == MTLCommandBufferStatusCompleted) {
+            memcpy(argmax,  base + 1*sec, (size_t) n_tokens * sizeof(int));
+            memcpy(entropy, base + 2*sec, (size_t) n_tokens * sizeof(float));
+            memcpy(sampled, base + 3*sec, (size_t) n_tokens * sizeof(int));
+            ok = true;
+        }
+    }
+
+    [g_dg_scratch_lock unlock];
+
+    return ok;
+}

@@ -292,6 +292,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 
+// Stage-1 diffusion sampler over a device-resident logits tensor (DiffusionGemma entropy-bound decoder).
+// Synchronous: encodes one kernel launch on the device queue and waits; outputs land in the host arrays.
+bool ggml_metal_device_diffusion_sample(ggml_metal_device_t dev, struct ggml_tensor * logits,
+        const float * u, int * argmax, float * entropy, int * sampled, int n_tokens, float inv_temp);
+
 //
 // device buffers
 //
