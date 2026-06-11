@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+
 static float calculate_confidence(const llama_token_data_array & cur_p,
                                   diffusion_algorithm            algorithm,
                                   std::mt19937 &                 rng) {
@@ -592,6 +596,72 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         }
 
         // per position: argmax, entropy of softmax(raw/t), and a multinomial sample; stash raw row for SC
+#ifdef __APPLE__
+        // Accelerate-vectorized host path: argmax matches the scalar loop bit-for-bit; Z, H, and the
+        // sampled cumulative differ only by reduction order (same tolerance as the device sampler).
+        // H = -sum(p log p) with p = e_v/Z and log p = z_v - log Z  ==>  H = log Z - dot(e, z)/Z.
+        auto worker = [&](int32_t p0, int32_t p1) {
+            const int n    = (int) n_vocab;
+            const int blk  = 8192;
+            const int nblk = (n + blk - 1) / blk;
+            std::vector<float> zbuf((size_t) n), ebuf((size_t) n), bsum((size_t) nblk);
+            for (int32_t pos = p0; pos < p1; pos++) {
+                const float * row = logits + (size_t) (logit_off + pos) * n_vocab;
+
+                vDSP_vsmul(row, 1, &temp_inv, zbuf.data(), 1, (vDSP_Length) n);   // z = row * temp_inv
+                float m; vDSP_Length amax;
+                vDSP_maxvi(zbuf.data(), 1, &m, &amax, (vDSP_Length) n);           // m, argmax
+                const float neg_m = -m;
+                vDSP_vsadd(zbuf.data(), 1, &neg_m, zbuf.data(), 1, (vDSP_Length) n); // z -= m
+                // floor z so -inf logits (masked tokens) give e = exp(-80) ~ 1.8e-35 instead of
+                // e = 0 with z = -inf, whose 0 * -inf product would turn the dot into NaN entropy.
+                const float z_floor = -80.0f;
+                vDSP_vthr(zbuf.data(), 1, &z_floor, zbuf.data(), 1, (vDSP_Length) n);
+                vvexpf(ebuf.data(), zbuf.data(), &n);                              // e = exp(z)
+
+                // per-block partial sums serve both Z and the multinomial crossing search
+                float Z = 0.0f;
+                for (int ib = 0; ib < nblk; ib++) {
+                    const int b0 = ib * blk;
+                    const int bn = std::min(blk, n - b0);
+                    vDSP_sve(ebuf.data() + b0, 1, &bsum[(size_t) ib], (vDSP_Length) bn);
+                    Z += bsum[(size_t) ib];
+                }
+                float S;
+                vDSP_dotpr(ebuf.data(), 1, zbuf.data(), 1, &S, (vDSP_Length) n);   // S = dot(e, z)
+                const float H = logf(Z) - S / Z;
+
+                // multinomial: first v (vocab order) with cumsum(e) >= u*Z. Block sums skip ahead;
+                // if FP reduction order makes a claimed crossing vanish inside a block, the
+                // sequential cum carries into the next block instead of falling back, so the
+                // n_vocab-1 default only remains when the cumulative sum truly never reaches target.
+                const float target = u[pos] * Z;
+                int32_t sampled = (int32_t) n_vocab - 1;
+                bool    picked  = false;
+                float   cum     = 0.0f;
+                for (int ib = 0; ib < nblk && !picked; ib++) {
+                    const int b0 = ib * blk;
+                    const int bn = std::min(blk, n - b0);
+                    if (cum + bsum[(size_t) ib] < target) {
+                        cum += bsum[(size_t) ib];
+                        continue;
+                    }
+                    for (int v = b0; v < b0 + bn; v++) {
+                        cum += ebuf[(size_t) v];
+                        if (cum >= target) { sampled = v; picked = true; break; }
+                    }
+                }
+
+                entropy[pos]       = H;
+                argmax_canvas[pos] = (int32_t) amax;
+                denoiser[pos]      = sampled;
+                // device SC keeps prev-step logits on-device (cpy in-graph), so no host stash needed
+                if (!dev_sc) {
+                    std::memcpy(sc_buffer.data() + (size_t) pos * n_vocab, row, n_vocab * sizeof(float));
+                }
+            }
+        };
+#else
         auto worker = [&](int32_t p0, int32_t p1) {
             for (int32_t pos = p0; pos < p1; pos++) {
                 const float * row = logits + (size_t) (logit_off + pos) * n_vocab;
@@ -623,6 +693,7 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                 }
             }
         };
+#endif
         auto run_host_worker = [&]() {
             std::vector<std::thread> pool;
             const int32_t chunk = (C + (int32_t) nth - 1) / (int32_t) nth;
