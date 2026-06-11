@@ -868,9 +868,40 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+// DiffusionGemma Stage-1 dense sampler (reduction lives in ggml-metal-diffusion-sample.cpp).
+// Shared and mapped Metal buffers are unified memory, so the sc_dev rows are reduced in place on
+// the host with no device kernel and no logits fetch; private-storage tensors fall back to the
+// host path.
+extern "C" bool ggml_backend_metal_diffusion_sample(
+        struct ggml_tensor * logits, const float * u, int * argmax, float * entropy,
+        int * sampled, int n_tokens, float inv_temp) {
+    if (!logits || n_tokens <= 0) {
+        return false;
+    }
+    if (logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) || logits->data == nullptr) {
+        return false;
+    }
+    const int n_vocab = (int) logits->ne[0];
+    if (n_vocab <= 0 || (int) ggml_nrows(logits) < n_tokens) {
+        return false;
+    }
+    if (!logits->buffer || !ggml_backend_buffer_is_metal(logits->buffer)) {
+        return false;
+    }
+    ggml_metal_buffer_t buf_ctx = (ggml_metal_buffer_t) logits->buffer->context;
+    if (!ggml_metal_buffer_is_shared(buf_ctx)) {
+        return false;  // private storage is not host-visible -> caller falls back to the host path
+    }
+    return ggml_backend_metal_diffusion_sample_impl(
+            (const float *) logits->data, u, argmax, entropy, sampled, n_tokens, n_vocab, inv_temp);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_diffusion_sample") == 0) {
+        return (void *)ggml_backend_metal_diffusion_sample;
     }
 
     return NULL;

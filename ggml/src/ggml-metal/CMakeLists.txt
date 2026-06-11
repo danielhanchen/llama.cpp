@@ -1,6 +1,7 @@
-find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
-find_library(METAL_FRAMEWORK    Metal      REQUIRED)
-find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
+find_library(FOUNDATION_LIBRARY  Foundation REQUIRED)
+find_library(METAL_FRAMEWORK     Metal      REQUIRED)
+find_library(METALKIT_FRAMEWORK  MetalKit   REQUIRED)
+find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
 
 message(STATUS "Metal framework found")
 
@@ -11,12 +12,14 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-common.cpp
                          ggml-metal-context.m
                          ggml-metal-ops.cpp
+                         ggml-metal-diffusion-sample.cpp
                         )
 
 target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}
                       ${METAL_FRAMEWORK}
                       ${METALKIT_FRAMEWORK}
+                      ${ACCELERATE_FRAMEWORK}
                       )
 
 if (GGML_METAL_NDEBUG)

@@ -305,6 +305,13 @@ void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 
+// DiffusionGemma Stage-1 dense sampler reduction (ggml-metal-diffusion-sample.cpp): rows of a
+// host-visible logits buffer are reduced in place on the CPU. Declared here so the defining and
+// calling TUs share one prototype.
+bool ggml_backend_metal_diffusion_sample_impl(
+        const float * base, const float * u, int * argmax, float * entropy,
+        int * sampled, int n_tokens, int n_vocab, float inv_temp);
+
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);

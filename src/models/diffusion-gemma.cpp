@@ -2,6 +2,7 @@
 #include "gemma4-common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -566,10 +567,26 @@ size_t llama_diffusion_debug_get_sc_dev(const struct llama_model * model, float 
     return n;
 }
 
-// Stage-1 device sampling entry. Fetches the CUDA backend's dense sampler via the backend-reg proc address
-// (keeps the llama<->ggml-cuda link at the existing backend boundary) and runs it on sc_dev. Returns false
-// for non-DiffusionGemma / no sc_dev / non-CUDA builds so the caller falls back to the host path.
-typedef bool (*dg_cuda_sample_fn)(struct ggml_tensor *, const float *, int *, float *, int *, int, float);
+// Stage-1 device sampling entry. Fetches a backend dense sampler via the backend-reg proc address
+// (keeps the llama<->ggml-backend link at the existing backend boundary) and runs it on sc_dev. CUDA
+// runs a device kernel; Metal reduces the shared-memory tensor in place on the host (unified memory),
+// which skips the per-step full-logits fetch. Returns false for non-DiffusionGemma / no sc_dev /
+// unsupported backends so the caller falls back to the host path.
+typedef bool (*dg_dev_sample_fn)(struct ggml_tensor *, const float *, int *, float *, int *, int, float);
+
+static dg_dev_sample_fn dg_resolve_dev_sample_fn() {
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        if (void * p = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample")) {
+            return (dg_dev_sample_fn) p;
+        }
+    }
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL")) {
+        if (void * p = ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_diffusion_sample")) {
+            return (dg_dev_sample_fn) p;
+        }
+    }
+    return nullptr;
+}
 
 bool llama_diffusion_device_sample(const struct llama_model * model, const float * u, int * argmax,
                                    float * entropy, int * sampled, int n_tokens, float inv_temp) {
@@ -577,16 +594,21 @@ bool llama_diffusion_device_sample(const struct llama_model * model, const float
     if (!dm || dm->sc_dev == nullptr || !u || !argmax || !entropy || !sampled || n_tokens <= 0) {
         return false;
     }
-    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
-    if (!reg) {
+    // re-resolve while null so a backend registered after the first call (dynamic backend
+    // loading) is still picked up; only a successful resolution is cached. Atomic because this
+    // is a public llama.h entry point that external callers may hit from multiple threads.
+    static std::atomic<dg_dev_sample_fn> fn{nullptr};
+    dg_dev_sample_fn f = fn.load(std::memory_order_relaxed);
+    if (f == nullptr) {
+        f = dg_resolve_dev_sample_fn();
+        if (f != nullptr) {
+            fn.store(f, std::memory_order_relaxed);
+        }
+    }
+    if (f == nullptr) {
         return false;
     }
-    static dg_cuda_sample_fn fn =
-        (dg_cuda_sample_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample");
-    if (!fn) {
-        return false;
-    }
-    return fn(dm->sc_dev, u, argmax, entropy, sampled, n_tokens, inv_temp);
+    return f(dm->sc_dev, u, argmax, entropy, sampled, n_tokens, inv_temp);
 }
 
 llama_model_diffusion_gemma::~llama_model_diffusion_gemma() {
