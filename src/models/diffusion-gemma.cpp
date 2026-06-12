@@ -566,10 +566,24 @@ size_t llama_diffusion_debug_get_sc_dev(const struct llama_model * model, float 
     return n;
 }
 
-// Stage-1 device sampling entry. Fetches the CUDA backend's dense sampler via the backend-reg proc address
-// (keeps the llama<->ggml-cuda link at the existing backend boundary) and runs it on sc_dev. Returns false
-// for non-DiffusionGemma / no sc_dev / non-CUDA builds so the caller falls back to the host path.
-typedef bool (*dg_cuda_sample_fn)(struct ggml_tensor *, const float *, int *, float *, int *, int, float);
+// Stage-1 device sampling entry. Fetches the backend's dense sampler via the backend-reg proc address
+// (keeps the llama<->ggml backend link at the existing boundary) and runs it on sc_dev. Returns false
+// for non-DiffusionGemma / no sc_dev / unsupported backends so the caller falls back to the host path.
+typedef bool (*dg_dense_sample_fn)(struct ggml_tensor *, const float *, int *, float *, int *, int, float);
+
+static dg_dense_sample_fn dg_resolve_dense_sample_fn() {
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        if (void * fn = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample")) {
+            return (dg_dense_sample_fn) fn;
+        }
+    }
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL")) {
+        if (void * fn = ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_diffusion_sample")) {
+            return (dg_dense_sample_fn) fn;
+        }
+    }
+    return nullptr;
+}
 
 bool llama_diffusion_device_sample(const struct llama_model * model, const float * u, int * argmax,
                                    float * entropy, int * sampled, int n_tokens, float inv_temp) {
@@ -577,12 +591,7 @@ bool llama_diffusion_device_sample(const struct llama_model * model, const float
     if (!dm || dm->sc_dev == nullptr || !u || !argmax || !entropy || !sampled || n_tokens <= 0) {
         return false;
     }
-    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
-    if (!reg) {
-        return false;
-    }
-    static dg_cuda_sample_fn fn =
-        (dg_cuda_sample_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample");
+    static dg_dense_sample_fn fn = dg_resolve_dense_sample_fn();
     if (!fn) {
         return false;
     }

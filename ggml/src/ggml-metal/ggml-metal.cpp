@@ -868,9 +868,24 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+// Stage-1 DiffusionGemma sampler, exposed via get_proc_address so llama can reach it across the backend
+// boundary (mirrors ggml_backend_cuda_diffusion_sample). Single Metal GPU -> device 0.
+static bool ggml_backend_metal_diffusion_sample(struct ggml_tensor * logits, const float * u,
+        int * argmax, float * entropy, int * sampled, int n_tokens, float inv_temp) {
+    ggml_metal_device_t dev = ggml_metal_device_get(0);
+    if (!dev) {
+        return false;
+    }
+    return ggml_metal_device_diffusion_sample(dev, logits, u, argmax, entropy, sampled, n_tokens, inv_temp);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+
+    if (strcmp(name, "ggml_backend_metal_diffusion_sample") == 0) {
+        return (void *)ggml_backend_metal_diffusion_sample;
     }
 
     return NULL;
