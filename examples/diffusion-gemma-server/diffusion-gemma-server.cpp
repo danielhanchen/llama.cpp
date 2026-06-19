@@ -12,6 +12,7 @@
 // Usage: llama-diffusion-gemma-server <model.gguf>   (env NGL for gpu layers, FA for flash-attn)
 
 #include "llama.h"
+#include "ggml-backend.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +35,7 @@ int main(int argc, char ** argv) {
     const int MAXTOK = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "2304");
 
     llama_backend_init();
+    ggml_backend_load_all(); // load dynamic backends so NGL can offload to GPU
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = atoi(getenv("NGL") ? getenv("NGL") : "0");
     llama_model * model = llama_model_load_from_file(argv[1], mparams);
@@ -126,7 +128,7 @@ int main(int argc, char ** argv) {
                 if (cur_prompt[i] != req[hdr + i]) new_block = true;
             }
             if (new_block) {
-                llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, P);
+                llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, P, /*off=*/0);  // single-shot prefill
                 llama_diffusion_set_sc(model, sc_cache.data(), 0.0f, 1.0f, false); // prompt has no SC
                 batch.n_tokens = P;
                 for (int i = 0; i < P; ++i) {
@@ -145,7 +147,7 @@ int main(int argc, char ** argv) {
                 cur_prompt.assign(req.begin() + hdr, req.begin() + hdr + P);
             }
             // DECODE: forward the canvas only (pos P..P+C-1), reading the cached prompt K,V.
-            llama_diffusion_set_phase(model, /*PKV_DECODE=*/2, P);
+            llama_diffusion_set_phase(model, /*PKV_DECODE=*/2, P, 0);
             llama_diffusion_set_sc(model, sc_cache.data(), use_sc ? 1.0f : 0.0f,
                                    use_sc ? 1.0f / prev_temp : 1.0f, true);
             batch.n_tokens = C;

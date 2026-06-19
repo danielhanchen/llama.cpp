@@ -497,19 +497,30 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
     // canvas logits then start at row 0 (cached) instead of row n_input (unified).
     const int32_t logit_off = params.kv_cache ? 0 : n_input;
     if (params.kv_cache) {
-        llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, n_input);
         llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
-        batch.n_tokens = n_input;
-        for (int32_t i = 0; i < n_input; i++) {
-            batch.token[i]     = input_tokens[i];
-            batch.pos[i]       = i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = 1;  // encode() forces all rows to output anyway; set them so it stays quiet
+        // Chunked causal PREFILL: feed the prompt in ubatch-sized chunks, each writing its K/V to the store and
+        // attending causally over the prefix. Keeps n_tokens <= n_ubatch, so the buffer tracks the chunk, not the prompt.
+        const int32_t U = std::max(1, (int32_t) llama_n_ubatch(ctx));
+        bool prefill_ok = true;
+        for (int32_t s = 0; s < n_input && prefill_ok; s += U) {
+            const int32_t u = std::min(U, n_input - s);
+            llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, n_input, /*off=*/s);
+            batch.n_tokens = u;
+            for (int32_t i = 0; i < u; i++) {
+                batch.token[i]     = input_tokens[s + i];
+                batch.pos[i]       = s + i;
+                batch.n_seq_id[i]  = 1;
+                batch.seq_id[i][0] = 0;
+                // PREFILL logits are unused; flag one row per chunk so a capped n_outputs_max reserves one row.
+                batch.logits[i]    = (i == u - 1) ? 1 : 0;
+            }
+            if (llama_decode(ctx, batch) != 0) {
+                LOG_ERR("%s: PREFILL chunk [%d,%d) decode failed\n", __func__, s, s + u);
+                prefill_ok = false;
+            }
         }
-        if (llama_decode(ctx, batch) != 0) {
-            LOG_ERR("%s: PREFILL decode failed\n", __func__);
-            llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0);
+        if (!prefill_ok) {
+            llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0, 0);
             llama_batch_free(batch);
             return;
         }
@@ -526,7 +537,7 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         const float   temp_inv = 1.0f / t;
 
         if (params.kv_cache) {
-            llama_diffusion_set_phase(model, /*PKV_DECODE=*/2, n_input);
+            llama_diffusion_set_phase(model, /*PKV_DECODE=*/2, n_input, 0);
             batch.n_tokens = C;
             for (int32_t i = 0; i < C; i++) {
                 batch.token[i]     = current_canvas[i];
@@ -557,36 +568,13 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         }
 
         // Stage-1: when on, skip the 268 MB logits D2H + host reductions and sample on the GPU from sc_dev.
-        // DG_DEVSAMPLE_CHECK forces both paths so we can diff them; it needs the host logits, so fetch them.
         const bool gpu_reduce  = dev_sc && device_sample_ok;
-        const bool want_logits = !gpu_reduce || std::getenv("DG_DEVSAMPLE_CHECK") || std::getenv("DG_SC_CHECK");
+        const bool want_logits = !gpu_reduce;
         const float * logits = nullptr;                           // canvas rows packed: [C or max_length, n_vocab]
         if (want_logits) {
             logits = llama_get_logits(ctx);
         } else {
             llama_synchronize(ctx);                               // sc_dev write must complete before we read it
-        }
-
-        // debug: verify the device SC buffer captured exactly this step's canvas logits (== what the host
-        // path uploads next step). Single-run check, independent of cross-run nondeterminism. DG_SC_CHECK=1.
-        if (dev_sc && logits && std::getenv("DG_SC_CHECK")) {
-            static std::vector<float> sc_dbg;
-            sc_dbg.resize((size_t) C * n_vocab);
-            const size_t got = llama_diffusion_debug_get_sc_dev(model, sc_dbg.data(), sc_dbg.size());
-            double maxabs = 0.0; size_t nmiss = 0; double sumabs = 0.0;
-            for (int32_t pos = 0; pos < C; pos++) {
-                const float * hrow = logits + (size_t) (logit_off + pos) * n_vocab;
-                const float * drow = sc_dbg.data() + (size_t) pos * n_vocab;
-                for (int32_t v = 0; v < n_vocab; v++) {
-                    const double d = std::fabs((double) hrow[v] - (double) drow[v]);
-                    sumabs += d;
-                    if (d > maxabs) { maxabs = d; }
-                    if (d != 0.0) { nmiss++; }
-                }
-            }
-            LOG_INF("DG_SC_CHECK step %d: got=%zu maxabs=%.6g sumabs=%.6g nmiss=%zu/%zu sc_dev[0]=%.4f host[0]=%.4f\n",
-                    step_idx, got, maxabs, sumabs, nmiss, (size_t) C * n_vocab,
-                    sc_dbg.empty() ? 0.0f : sc_dbg[0], logits[(size_t) logit_off * n_vocab]);
         }
 
         // pre-draw the step's randomness single-threaded so the output is seed-reproducible
@@ -718,28 +706,6 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                 }
                 if (!logits) { logits = llama_get_logits(ctx); }
                 run_host_worker();
-            } else if (std::getenv("DG_DEVSAMPLE_CHECK")) {
-                // run the host worker into shadow buffers with the SAME u and diff: argmax must be exact.
-                std::vector<llama_token> h_argmax = argmax_canvas, h_denoise = denoiser;
-                std::vector<float>       h_entropy = entropy;
-                std::vector<llama_token> d_argmax = argmax_canvas, d_denoise = denoiser;
-                std::vector<float>       d_entropy = entropy;
-                std::swap(argmax_canvas, h_argmax); std::swap(denoiser, h_denoise); std::swap(entropy, h_entropy);
-                run_host_worker();  // fills argmax_canvas/denoiser/entropy from host
-                int  amax_mismatch = 0, tok_diff = 0; double max_dH = 0.0, max_relZ = 0.0;
-                for (int32_t pos = 0; pos < C; pos++) {
-                    if (argmax_canvas[pos] != d_argmax[pos]) { amax_mismatch++; }
-                    if (denoiser[pos]      != d_denoise[pos]) { tok_diff++; }
-                    const double dH = std::fabs((double) entropy[pos] - (double) d_entropy[pos]);
-                    if (dH > max_dH) { max_dH = dH; }
-                    const double relZ = std::fabs((double) entropy[pos] - (double) d_entropy[pos]) /
-                                        (std::fabs((double) entropy[pos]) + 1e-6);
-                    if (relZ > max_relZ) { max_relZ = relZ; }
-                }
-                LOG_INF("DG_DEVSAMPLE_CHECK step %d: amax_mismatch=%d/%d tok_diff=%d/%d max|dH|=%.3e max_relH=%.3e\n",
-                        step_idx, amax_mismatch, C, tok_diff, C, max_dH, max_relZ);
-                // keep the DEVICE result for the actual run (host shadow was only for the diff)
-                std::swap(argmax_canvas, d_argmax); std::swap(denoiser, d_denoise); std::swap(entropy, d_entropy);
             }
         } else {
             run_host_worker();
@@ -778,7 +744,7 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
     }
 
     if (params.kv_cache) {
-        llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0);  // restore default for later turns / masked path
+        llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0, 0);  // restore default for later turns / masked path
     }
     if (dev_sc) {
         llama_diffusion_set_device_sc(model, false);             // restore host SC path for later turns
