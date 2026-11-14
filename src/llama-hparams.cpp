@@ -206,13 +206,14 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_r() const {
-    if (n_embd_r_impl != 0) {
-        return n_embd_r_impl;
-    }
-
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
+    }
+
+    if (n_embd_r_impl != 0) {
+        // for Inkling (attention conv state set by the model)
+        return n_embd_r_impl;
     }
 
     if (n_shortconv_l_cache != 0) {

@@ -3321,7 +3321,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING) {
+                    } else if (arch == LLM_ARCH_FALCON_H1) {
+                        filter_attn = [&](uint32_t) { return true; };
+                        filter_recr = [&](uint32_t) { return true; };
+                    } else if (arch == LLM_ARCH_INKLING) {
                         // all layers have both an attention KV cache and a recurrent (conv) state
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
