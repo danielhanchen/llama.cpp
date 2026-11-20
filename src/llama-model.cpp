@@ -1930,6 +1930,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
                 layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
+            if (!layer.ffn_gate_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_gate_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
