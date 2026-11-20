@@ -477,7 +477,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
                 il,
                 nullptr,
-                layer.ffn_gate_up_exps);
+                layer.ffn_gate_up_exps,
+                layer.ffn_gate_up_exps_s, // scale for the merged gate/up NVFP4 experts
+                nullptr,                  // gate_exps_s (no separate gate experts)
+                layer.ffn_down_exps_s);   // scale for the down NVFP4 experts
 
         cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
         cb(cur, "ffn_out", il);
