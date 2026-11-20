@@ -214,7 +214,7 @@ void main() {
                         uint32_t kcol;
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + fa_mask_col]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
