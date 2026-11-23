@@ -220,9 +220,9 @@ void main() {
                             max_mask = max(max_mask, float(m));
                         } else {
 #if defined(FLOAT16)
-                            masksh[c * masksh_stride + r] = USE_SPARSE ? FLOAT_TYPE(NEG_FLT16_MAX) : FLOAT_TYPE(0);
+                            masksh[c * masksh_stride + r] = (USE_SPARSE || KV_ROWS_ENABLE) ? FLOAT_TYPE(NEG_FLT16_MAX) : FLOAT_TYPE(0);
 #else
-                            masksh[c * masksh_stride + r] = USE_SPARSE ? FLOAT_TYPE(NEG_FLT_MAX_OVER_2) : FLOAT_TYPE(0);
+                            masksh[c * masksh_stride + r] = (USE_SPARSE || KV_ROWS_ENABLE) ? FLOAT_TYPE(NEG_FLT_MAX_OVER_2) : FLOAT_TYPE(0);
 #endif
                         }
                     }

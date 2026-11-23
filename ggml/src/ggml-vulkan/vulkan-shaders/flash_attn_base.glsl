@@ -238,26 +238,24 @@ void init_indices()
     }
 }
 
-// Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
+// Resolve a linear KV slot to a physical row for the gather paths.
+// Row lists are [KV, n_streams] and share one list across the KV heads of a stream.
+int fa_gather_row(uint lin) {
+    if (KV_ROWS_ENABLE) {
+        return lin < KV ? data_sparse[(iq3 % p.nem3) * KV + lin] : -1;
+    }
+    return lin < p.split_kv ? data_sparse[sparse_base + lin] : -1;
+}
+
+uint fa_gather_count() {
+    return KV_ROWS_ENABLE ? KV : p.split_kv;
+}
+
+// Resolve a linear KV slot to a real column; false for inactive (gather padding/-1, or dense OOB).
 bool fa_kv_index(uint lin, out uint kv_col) {
     fa_mask_col = lin;
-    if (KV_ROWS_ENABLE) {
-        // kv_rows is [KV, n_streams]; KV is the number of mask columns. The list
-        // is shared by all KV heads of a stream and clamped like the CPU path.
-        if (lin >= KV) {
-            kv_col = 0;
-            return false;
-        }
-        int idx = data_sparse[(iq3 % p.nem3) * KV + lin];
-        kv_col = idx >= 0 ? uint(idx) : 0;
-        return true;
-    }
-    if (USE_SPARSE) {
-        if (lin >= p.split_kv) {
-            kv_col = 0;
-            return false;
-        }
-        int idx = data_sparse[sparse_base + lin];
+    if (KV_ROWS_ENABLE || USE_SPARSE) {
+        int idx = fa_gather_row(lin);
         kv_col = idx >= 0 ? uint(idx) : 0;
         return idx >= 0;
     }

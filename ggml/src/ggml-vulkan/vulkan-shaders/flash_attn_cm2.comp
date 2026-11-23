@@ -26,6 +26,11 @@
 
 #include "types.glsl"
 #include "flash_attn_base.glsl"
+
+// Row lists and sparse both gather K/V through binding 7; the mask stays linear
+// for row lists but follows the physical row for sparse.
+const bool USE_GATHER = USE_SPARSE || KV_ROWS_ENABLE;
+
 #if !defined(BFLOAT16)
 #include "dequant_funcs_cm2.glsl"
 #endif
@@ -131,8 +136,8 @@ layout (binding = 2) readonly buffer V16V4 {FLOAT_TYPEV4 data_v16v4[];};
 uint32_t g_k_off_elem, g_v_off_elem, g_m_off_elem;
 
 FLOAT_TYPE faGatherK(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPE(0.0); }
-    const int r = data_sparse[sparse_base + blockCoords[0]];
+    if (blockCoords[0] >= fa_gather_count()) { return FLOAT_TYPE(0.0); }
+    const int r = fa_gather_row(blockCoords[0]);
     if (r < 0) { return FLOAT_TYPE(0.0); }
 #if !defined(BFLOAT16)
     if (USE_DECODE_K) {
@@ -144,8 +149,8 @@ FLOAT_TYPE faGatherK(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], c
 }
 
 FLOAT_TYPE faGatherV(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPE(0.0); }
-    const int r = data_sparse[sparse_base + blockCoords[0]];
+    if (blockCoords[0] >= fa_gather_count()) { return FLOAT_TYPE(0.0); }
+    const int r = fa_gather_row(blockCoords[0]);
     if (r < 0) { return FLOAT_TYPE(0.0); }
 #if !defined(BFLOAT16)
     if (USE_DECODE_V) {
@@ -158,8 +163,8 @@ FLOAT_TYPE faGatherV(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], c
 
 #ifdef GL_NV_cooperative_matrix_decode_vector
 FLOAT_TYPEV4 faGatherKVector(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPEV4(0.0); }
-    const int r = data_sparse[sparse_base + blockCoords[0]];
+    if (blockCoords[0] >= fa_gather_count()) { return FLOAT_TYPEV4(0.0); }
+    const int r = fa_gather_row(blockCoords[0]);
     if (r < 0) { return FLOAT_TYPEV4(0.0); }
 #if !defined(BFLOAT16)
     if (USE_DECODE_K) {
@@ -172,8 +177,8 @@ FLOAT_TYPEV4 faGatherKVector(const decodeBufFA_K bl_in, const uint32_t blockCoor
 }
 
 FLOAT_TYPEV4 faGatherVVector(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
-    if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPEV4(0.0); }
-    const int r = data_sparse[sparse_base + blockCoords[0]];
+    if (blockCoords[0] >= fa_gather_count()) { return FLOAT_TYPEV4(0.0); }
+    const int r = fa_gather_row(blockCoords[0]);
     if (r < 0) { return FLOAT_TYPEV4(0.0); }
 #if !defined(BFLOAT16)
     if (USE_DECODE_V) {
@@ -201,9 +206,11 @@ FLOAT_TYPEV4 faGatherVVector(const decodeBufFA_V bl_in, const uint32_t blockCoor
 
 ACC_TYPE faAddSparseMask(const uint32_t row, const uint32_t col, const ACC_TYPE elem, const uint32_t jblk) {
     const uint32_t kvslot = jblk * Bc + col;
-    if (kvslot >= p.split_kv) { return ACC_TYPE_NEG; }
-    const int r = data_sparse[sparse_base + kvslot];
-    return r < 0 ? ACC_TYPE_NEG : elem + ACC_TYPE(data_mf16[g_m_off_elem + row * m_stride + uint(r)]);
+    if (kvslot >= fa_gather_count()) { return ACC_TYPE_NEG; }
+    const int r = fa_gather_row(kvslot);
+    if (r < 0) { return ACC_TYPE_NEG; }
+    const uint32_t mask_col = KV_ROWS_ENABLE ? kvslot : uint(r);
+    return elem + ACC_TYPE(data_mf16[g_m_off_elem + row * m_stride + mask_col]);
 }
 
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
@@ -284,13 +291,13 @@ void main() {
 
     tensorViewNV<2, false, 1, 0> tensorViewTranspose = createTensorViewNV(2, false, 1, 0);
 
-    const uint bs_k = USE_SPARSE ? max(FA_GATHER_BS, BLOCK_SIZE_K) : BLOCK_SIZE_K;
-    const uint bs_v = USE_SPARSE ? max(FA_GATHER_BS, BLOCK_SIZE_V) : BLOCK_SIZE_V;
+    const uint bs_k = USE_GATHER ? max(FA_GATHER_BS, BLOCK_SIZE_K) : BLOCK_SIZE_K;
+    const uint bs_v = USE_GATHER ? max(FA_GATHER_BS, BLOCK_SIZE_V) : BLOCK_SIZE_V;
     tensorLayoutK = setTensorLayoutBlockSizeNV(tensorLayoutK, 1, bs_k);
     tensorLayoutV = setTensorLayoutBlockSizeNV(tensorLayoutV, 1, bs_v);
 
-    // Sparse iterates n_kv_max (in split_kv); the decode callbacks remap each slot.
-    const uint32_t KV_iter = USE_SPARSE ? p.split_kv : KV;
+    // Gather paths iterate the linear slot count; the decode callbacks remap each slot.
+    const uint32_t KV_iter = USE_GATHER ? fa_gather_count() : KV;
     tensorLayoutQ = setTensorLayoutDimensionNV(tensorLayoutQ, N, HSK);
     tensorLayoutK = setTensorLayoutDimensionNV(tensorLayoutK, KV_iter, HSK);
     tensorLayoutV = setTensorLayoutDimensionNV(tensorLayoutV, KV_iter, HSV);
@@ -414,7 +421,7 @@ void main() {
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
         // F16: bs_k==1 (direct load). F32: bs_k==4 (vec4 / dequantFuncF32). Quantized types: bs_k==32.
-        if (USE_SPARSE) {
+        if (USE_GATHER) {
             coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose FAGATHERK);
 #if !defined(BFLOAT16)
         } else if (USE_DECODE_K) {
@@ -432,7 +439,7 @@ void main() {
             }
         }
 
-        if (MASK_ENABLE && USE_SPARSE) {
+        if (MASK_ENABLE && USE_GATHER) {
             coopMatPerElementNV(S, S, faAddSparseMask, j);
         } else if (MASK_ENABLE) {
             S += slopeMat*coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(mv);
@@ -485,7 +492,7 @@ void main() {
 
         coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Bc, HSV_pad, gl_MatrixUseB> V;
         uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
-        if (USE_SPARSE) {
+        if (USE_GATHER) {
             coopMatLoadTensorNV(V, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) FAGATHERV);
 #if !defined(BFLOAT16)
         } else if (USE_DECODE_V) {

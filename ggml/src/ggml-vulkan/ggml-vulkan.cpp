@@ -9129,11 +9129,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
+    // Row lists are gathered in the shader by all scalar/coopmat FA paths; let the
+    // normal tuning pick the fastest one for the device (and its K/V types).
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
-    if (kv_rows) {
-        // KV row-list gathering is implemented in the scalar shader path only.
-        tuning_params = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
-    }
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -9205,7 +9203,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // flipped coopmat1 path reads K/V rows with 16-byte loads
         const bool kv_16b = use_dequant_kv ||
             (((uintptr_t)k->data | (uintptr_t)v->data | nbk2_eff | nbk3_eff | nbv2_eff | nbv3_eff) % 16) == 0;
-        if (!aligned || use_sparse || gqa_ratio != 1 || !kv_16b) {
+        if (!aligned || use_sparse || kv_rows != nullptr || gqa_ratio != 1 || !kv_16b) {
             tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, false);
             alignment = tuning_params.block_cols;
             aligned = fa_aligned(tuning_params);
@@ -9365,7 +9363,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_k = CEIL_DIV(KV, split_kv);
     }
     if (kv_rows) {
-        // The scalar row-gather path uses one split and the whole row list.
+        // Walk the full linear row list in one split; the shader gathers the physical rows.
         split_k = 1;
         split_kv = KV;
     }
