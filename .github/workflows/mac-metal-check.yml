@@ -1,0 +1,70 @@
+name: mac-metal-check
+
+# Correctness of the Metal kernels in the unslothai/llama.cpp prebuilt (upstream tag + pr-set.json pins) and of an
+# added kernel commit (few-token MUL_MAT_ID). GitHub macOS runners expose an Apple Paravirtual GPU that hides the
+# simdgroup / bfloat features, so the env-gated force hooks are on (MAC_METAL_CI_HOOKS=1): results here are
+# correctness only, timing is not meaningful. Real timing: run scripts/mac-metal-check/mac_metal_check.sh on a Mac.
+
+on:
+  push:
+    branches: [mac-metal-check]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: upstream base tag of the prebuilt
+        default: b12722
+      mvid_commit:
+        description: added commit, <repo url>@<sha40>
+        default: https://github.com/danielhanchen/llama.cpp@084c4350e1d65893cc993a8369ad65ad95003e3f
+      quick:
+        description: skip the full FLASH_ATTN_EXT sweep
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-metal-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [pins, model+bench, mvid]
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      MAC_METAL_CI_HOOKS: "1"
+      NEED_GB: "5"
+      TAG: ${{ inputs.tag || 'b12722' }}
+      MVID_COMMIT: ${{ inputs.mvid_commit || 'https://github.com/danielhanchen/llama.cpp@084c4350e1d65893cc993a8369ad65ad95003e3f' }}
+      QUICK: ${{ inputs.quick && '1' || '0' }}
+      WORK: ${{ github.workspace }}/mac_metal_check_work
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: job
+      - name: check
+        run: |
+          case "${{ matrix.part }}" in
+            pins) export PARTS=pins ;;
+            model+bench) export PARTS=model,bench ;;
+            mvid) export PARTS=mvid ;;
+          esac
+          bash job/scripts/mac-metal-check/mac_metal_check.sh
+      - name: summary
+        if: always()
+        run: |
+          [ -f "$WORK/summary.md" ] && cat "$WORK/summary.md" >> "$GITHUB_STEP_SUMMARY" || echo "no summary (setup failed)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-metal-check-${{ matrix.part == 'model+bench' && 'model-bench' || matrix.part }}
+          path: |
+            mac_metal_check_*.tar.gz
+            mac_metal_check_work/mac_metal_check.json
+            mac_metal_check_work/summary.md
+          if-no-files-found: warn
