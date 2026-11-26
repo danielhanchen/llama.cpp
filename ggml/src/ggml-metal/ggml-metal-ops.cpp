@@ -3111,6 +3111,39 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
         }
+    } else if (ggml_metal_op_mul_mat_id_use_mv_ext(op)) {
+        // few tokens: one threadgroup column per (token, slot) entry, but only the first entry of each
+        // expert does the work - it applies the expert's rows once to every entry routed to that expert
+        const int nsg = 2;
+
+        const int16_t nxpsg = (ne00 % 256 == 0 && ne21 < 3) ? 16 : 8;
+        const int16_t r0ptg = (32/nxpsg)*nsg;
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id_ext(lib, op, nsg, nxpsg);
+
+        ggml_metal_kargs_mul_mv_id_ext args = {
+            /*.nei0 =*/ ne20,
+            /*.nei1 =*/ ne21,
+            /*.nbi1 =*/ nb21,
+            /*.ne00 =*/ ne00,
+            /*.ne01 =*/ ne01,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.ne11 =*/ ne11,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb1  =*/ nb1,
+            /*.nb2  =*/ nb2,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + r0ptg - 1)/r0ptg, 1, ne20*ne21, 32, nsg, 1);
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
 

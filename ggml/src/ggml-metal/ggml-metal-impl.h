@@ -638,6 +638,21 @@ typedef struct {
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
 
+typedef struct {
+    int32_t  nei0;  // n_expert_used
+    int32_t  nei1;  // n_tokens
+    uint64_t nbi1;
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;
+    uint64_t nb02;
+    int32_t  ne11;  // n_expert_used or 1 (bcast)
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb1;
+    uint64_t nb2;
+} ggml_metal_kargs_mul_mv_id_ext;
+
 // NORM
 // RMS_NORM
 typedef struct {

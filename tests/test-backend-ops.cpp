@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -6257,6 +6258,63 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// MUL_MAT_ID with every token routed to n_used distinct experts of a fixed pool of `pool` experts, so the
+// experts are shared across tokens (as consecutive tokens of a real MoE are)
+struct test_mul_mat_id_pool : public test_mul_mat_id {
+    const int pool;
+    uint32_t seed = 1234;
+
+    test_mul_mat_id_pool(ggml_type type_a, ggml_type type_b, int n_mats, int n_used, bool b,
+            int64_t m, int64_t n, int64_t k, int pool, int64_t m_v = 0, bool ids_offset = false)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, false), pool(pool) {
+        GGML_ASSERT(n_used <= pool && pool <= n_mats);
+    }
+
+    std::string vars() override { return test_mul_mat_id::vars() + ",pool=" + std::to_string(pool); }
+
+    void init_ids(ggml_context * ctx) {
+        std::default_random_engine rng(seed++);
+
+        std::vector<int32_t> experts(n_mats);
+        std::iota(experts.begin(), experts.end(), 0);
+        std::shuffle(experts.begin(), experts.end(), rng);
+        experts.resize(pool);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> row = experts;
+                std::shuffle(row.begin(), row.end(), rng);
+
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; i++) {
+                    data[i] = row[i % pool];
+                }
+                // the used slots start at 1 with an ids offset: keep them distinct
+                if (ids_offset) {
+                    std::rotate(data.begin(), data.end() - 1, data.end());
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        init_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_ids(ctx);
     }
 };
 
@@ -13037,6 +13095,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // few tokens (2..8), 128 experts, top-8: the Metal shared-weight kernel_mul_mv_id_ext and the types it leaves on
+    // kernel_mul_mv_id (IQ*); m = 194 leaves a partial row block, pool = experts shared across tokens,
+    // dup = repeated ids within a token (more than 8 entries for one expert)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0,
+                             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                             GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                             GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS}) {
+        for (int n = 2; n <= 8; n++) {
+            test_cases.emplace_back(new test_mul_mat_id     (type_a, GGML_TYPE_F32, 128, 8, false, 194, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id     (type_a, GGML_TYPE_F32, 128, 8, true,  194, n, 256, 0, false, true));
+            test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 8, true,  194, n, 256, 12));
+            test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 8, false, 194, n, 256, 8));
+            test_cases.emplace_back(new test_mul_mat_id_dup (type_a, GGML_TYPE_F32, 128, 8, false, 194, n, 256));
+        }
+        // ne00 % 256 != 0: 8 threads per row at 2 tokens
+        if (384 % ggml_blck_size(type_a) == 0) {
+            test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 8, true, 194, 2, 384, 12));
+        }
+    }
+    // strided experts + ids offset
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int n : {3, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 8, false, 194, n, 256, 12, 200, true));
+        }
+    }
+    // other n_used, ne00 % 128 != 0 (stays on kernel_mul_mv_id)
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 64, 6, false, 66, 5, 512, 9));
+        test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 64, 6, true,  66, 5, 192, 9));
+    }
+
     // n_used == n_mats, so every expert can be skipped
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, false, 512, 64, 256, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1, 0, false, true));
@@ -14654,6 +14743,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 2880, bs, 2880));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 2880, bs, 2880, 1));
+            }
+        }
+    }
+
+    // Inkling-2-Mini-like MoE (128 experts, top-8, gate_up 2304x2304, down 1152 -> 2304) at speculative-verify batch
+    // sizes, random routing and routing shared across tokens (pool of 20 experts)
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int bs : {1, 2, 3, 4, 8}) {
+            for (int64_t k : {2304, 1152}) {
+                if (k % ggml_blck_size(type_a) != 0) {
+                    continue;
+                }
+                const bool b = k == 2304;
+                test_cases.emplace_back(new test_mul_mat_id     (type_a, GGML_TYPE_F32, 128, 8, b, 2304, bs, k));
+                test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 8, b, 2304, bs, k, 20));
             }
         }
     }

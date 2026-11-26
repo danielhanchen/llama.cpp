@@ -929,6 +929,307 @@ template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_3")]] kernel mul_mv_ext_q4x4
 template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_q3_K, 256, dequantize_q3_K>;
 template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_5")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<5, block_q3_K, 256, dequantize_q3_K>;
 
+// MUL_MAT_ID for a few tokens (kernel_mul_mv_id_ext)
+//
+// kernel_mul_mv_id runs one mat-vec per (token, slot) entry, so an expert routed to several tokens is read once per
+// entry. Here the threadgroup of the first entry of each expert applies the expert's row block to the src1 rows of all
+// the entries routed to it (across tokens and repeated slots), so the expert's weights are read once. The inner loops
+// are those of kernel_mul_mv_ext_q4 / q4x4 with gathered src1 rows and dst rows.
+//
+// entry k = i21*nei0 + i20 (token i21, slot i20)
+
+inline int32_t mul_mv_id_ext_get_id(constant ggml_metal_kargs_mul_mv_id_ext & args, device const char * ids, int k) {
+    const int i21 = k/args.nei0;
+    const int i20 = k - i21*args.nei0;
+
+    return ((device const int32_t *) (ids + (uint64_t) i21*args.nbi1))[i20];
+}
+
+inline device float * mul_mv_id_ext_dst_row(constant ggml_metal_kargs_mul_mv_id_ext & args, device char * dst, int k) {
+    const int i21 = k/args.nei0;
+    const int i20 = k - i21*args.nei0;
+
+    return (device float *) (dst + (uint64_t) i20*args.nb1 + (uint64_t) i21*args.nb2);
+}
+
+inline device const char * mul_mv_id_ext_src1_row(constant ggml_metal_kargs_mul_mv_id_ext & args, device const char * src1, int k) {
+    const int i21 = k/args.nei0;
+    const int i20 = k - i21*args.nei0;
+
+    return src1 + (uint64_t) (i20%args.ne11)*args.nb11 + (uint64_t) i21*args.nb12;
+}
+
+// reduce the partial sums of the nxpsg threads of each src0 row and write the rows of the nent valid entries
+template<short NR1>
+void mul_mv_id_ext_reduce_write(
+        constant ggml_metal_kargs_mul_mv_id_ext & args,
+        device       char * dst,
+        thread       float * sumf,
+        thread const int   * ent,
+        short nent,
+        int   i01,
+        short tx) {
+    const short nxpsg = FC_mul_mv_nxpsg;
+
+    for (short ir1 = 0; ir1 < NR1; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
+        }
+        if (nxpsg >= 8) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
+        }
+        if (nxpsg >= 4) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
+        }
+        if (nxpsg >= 2) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
+        }
+    }
+
+    if (tx == 0 && i01 < args.ne01) {
+        for (short ir1 = 0; ir1 < NR1 && ir1 < nent; ++ir1) {
+            mul_mv_id_ext_dst_row(args, dst, ent[ir1])[i01] = sumf[ir1];
+        }
+    }
+}
+
+// src0 in chunks of float4, see kernel_mul_mv_ext_q4_f32_impl
+// chpb - chunks per quantization block
+template<typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &)>
+struct mul_mv_id_ext_q4 {
+    // NR1 src1 rows, the first nent of them valid (the others repeat entry 0 and are not written)
+    template<short NR1>
+    static void tile(
+            constant ggml_metal_kargs_mul_mv_id_ext & args,
+            device const char * src0_row,
+            device const char * src1,
+            device       char * dst,
+            thread const int  * ent,
+            short nent,
+            int   i01,
+            short tx) {
+        const short nxpsg = FC_mul_mv_nxpsg;
+
+        const short chpt = 4; // chunks per thread
+
+        device const q_t * xq = (device const q_t *) src0_row + tx/chpb;
+
+        device const float4 * y4[NR1];
+
+        for (short ir1 = 0; ir1 < NR1; ++ir1) {
+            y4[ir1] = (device const float4 *) mul_mv_id_ext_src1_row(args, src1, ent[ir1 < nent ? ir1 : 0]) + tx;
+        }
+
+        float sumf[NR1] = { [ 0 ... NR1 - 1 ] = 0.0f };
+
+        short cch = tx%chpb; // current chunk index
+
+        for (int ich = tx; 4*ich < args.ne00; ich += chpt*nxpsg) {
+            float4 lx[chpt];
+
+#pragma unroll(chpt)
+            for (short ch = 0; ch < chpt; ++ch) {
+                deq_t4(xq, cch, lx[ch]);
+
+                cch += nxpsg;
+                if (cch >= chpb) {
+                    xq  += cch/chpb;
+                    cch %= chpb;
+                }
+            }
+
+#pragma unroll(chpt)
+            for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(NR1)
+                for (short ir1 = 0; ir1 < NR1; ++ir1) {
+                    sumf[ir1] += dot(lx[ch], y4[ir1][ch*nxpsg]);
+                }
+            }
+
+#pragma unroll(NR1)
+            for (short ir1 = 0; ir1 < NR1; ++ir1) {
+                y4[ir1] += chpt*nxpsg;
+            }
+        }
+
+        mul_mv_id_ext_reduce_write<NR1>(args, dst, sumf, ent, nent, i01, tx);
+    }
+};
+
+// src0 in chunks of float4x4, see kernel_mul_mv_ext_q4x4_f32_impl
+template<typename q_t, short chpb, void (*deq_t4x4)(device const q_t *, short, thread float4x4 &)>
+struct mul_mv_id_ext_q4x4 {
+    template<short NR1>
+    static void tile(
+            constant ggml_metal_kargs_mul_mv_id_ext & args,
+            device const char * src0_row,
+            device const char * src1,
+            device       char * dst,
+            thread const int  * ent,
+            short nent,
+            int   i01,
+            short tx) {
+        const short nxpsg = FC_mul_mv_nxpsg;
+
+        const short chpt = 1;
+
+        device const q_t * xq = (device const q_t *) src0_row + tx/chpb;
+
+        device const float4x4 * y4x4[NR1];
+
+        for (short ir1 = 0; ir1 < NR1; ++ir1) {
+            y4x4[ir1] = (device const float4x4 *) mul_mv_id_ext_src1_row(args, src1, ent[ir1 < nent ? ir1 : 0]) + tx;
+        }
+
+        float sumf[NR1] = { [ 0 ... NR1 - 1 ] = 0.0f };
+
+        short cch = tx%chpb;
+
+        for (int ich = tx; 16*ich < args.ne00; ich += chpt*nxpsg) {
+            float4x4 lx[chpt];
+
+#pragma unroll(chpt)
+            for (short ch = 0; ch < chpt; ++ch) {
+                deq_t4x4(xq, cch, lx[ch]);
+
+                cch += nxpsg;
+                if (cch >= chpb) {
+                    xq  += cch/chpb;
+                    cch %= chpb;
+                }
+            }
+
+#pragma unroll(chpt)
+            for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(NR1)
+                for (short ir1 = 0; ir1 < NR1; ++ir1) {
+                    sumf[ir1] +=
+                        dot(lx[ch][0], y4x4[ir1][ch*nxpsg][0]) +
+                        dot(lx[ch][1], y4x4[ir1][ch*nxpsg][1]) +
+                        dot(lx[ch][2], y4x4[ir1][ch*nxpsg][2]) +
+                        dot(lx[ch][3], y4x4[ir1][ch*nxpsg][3]);
+                }
+            }
+
+#pragma unroll(NR1)
+            for (short ir1 = 0; ir1 < NR1; ++ir1) {
+                y4x4[ir1] += chpt*nxpsg;
+            }
+        }
+
+        mul_mv_id_ext_reduce_write<NR1>(args, dst, sumf, ent, nent, i01, tx);
+    }
+};
+
+// the gathered src1 rows are processed in tiles of at most NR1_MAX rows, the tile size rounded up to a power of 2
+#define MUL_MV_ID_EXT_NR1_MAX 8
+
+template<typename T>
+kernel void kernel_mul_mv_id_ext(
+        constant ggml_metal_kargs_mul_mv_id_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG   = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+    const short nypsg = 32/nxpsg;
+
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+
+    const int i01 = tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty;
+
+    const int n_ent = args.nei0*args.nei1;
+    const int k0    = tgpig.z; // the entry of this threadgroup
+
+    // all the branches below depend only on the ids, so they are uniform within the threadgroup
+    const int32_t e = mul_mv_id_ext_get_id(args, ids, k0);
+
+    if (e < 0) {
+        // skipped slot: its rows of this row block are zero
+        if (tx == 0 && i01 < args.ne01) {
+            mul_mv_id_ext_dst_row(args, dst, k0)[i01] = 0.0f;
+        }
+        return;
+    }
+
+    // the expert is done by the threadgroup of its first entry
+    for (int kb = 0; kb < k0; kb += 32) {
+        const int k = kb + tiisg;
+
+        const bool hit = k < k0 && mul_mv_id_ext_get_id(args, ids, k) == e;
+
+        if (simd_vote::vote_t(simd_ballot(hit)) != 0) {
+            return;
+        }
+    }
+
+    device const char * src0_row = i01 < args.ne01 ? src0 + (uint64_t) e*args.nb02 + (uint64_t) i01*args.nb01 : src0;
+
+    int   ent[MUL_MV_ID_EXT_NR1_MAX];
+    short nent = 0;
+
+    // gather the entries of the expert in order, 32 entries per step
+    for (int kb = k0; kb < n_ent; kb += 32) {
+        const int k = kb + tiisg;
+
+        const bool hit = k < n_ent && mul_mv_id_ext_get_id(args, ids, k) == e;
+
+        uint mask = (uint) simd_vote::vote_t(simd_ballot(hit));
+
+        while (mask != 0) {
+            ent[nent++] = kb + ctz(mask);
+            mask &= mask - 1;
+
+            if (nent == MUL_MV_ID_EXT_NR1_MAX) {
+                T::template tile<MUL_MV_ID_EXT_NR1_MAX>(args, src0_row, src1, dst, ent, nent, i01, tx);
+                nent = 0;
+            }
+        }
+    }
+
+    if (nent > 4) {
+        T::template tile<8>(args, src0_row, src1, dst, ent, nent, i01, tx);
+    } else if (nent > 2) {
+        T::template tile<4>(args, src0_row, src1, dst, ent, nent, i01, tx);
+    } else if (nent == 2) {
+        T::template tile<2>(args, src0_row, src1, dst, ent, nent, i01, tx);
+    } else if (nent == 1) {
+        T::template tile<1>(args, src0_row, src1, dst, ent, nent, i01, tx);
+    }
+}
+
+typedef decltype(kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q8_0, 8, dequantize_q8_0_t4>>) kernel_mul_mv_id_ext_t;
+
+template [[host_name("kernel_mul_mv_id_ext_f32_f32")]]    kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<float4,       1,  dequantize_f32_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_f16_f32")]]    kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<half4,        1,  dequantize_f16_t4>>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mv_id_ext_bf16_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<bfloat4,      1,  dequantize_bf16_t4>>;
+#endif
+template [[host_name("kernel_mul_mv_id_ext_q1_0_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q1_0,   32, dequantize_q1_0_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_q2_0_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q2_0,   16, dequantize_q2_0_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_q4_0_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q4_0,   8,  dequantize_q4_0_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_q4_1_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q4_1,   8,  dequantize_q4_1_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_q5_0_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q5_0,   8,  dequantize_q5_0_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_q5_1_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q5_1,   8,  dequantize_q5_1_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_q8_0_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_q8_0,   8,  dequantize_q8_0_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_mxfp4_f32")]]  kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_mxfp4,  8,  dequantize_mxfp4_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_nvfp4_f32")]]  kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_nvfp4,  16, dequantize_nvfp4_t4>>;
+template [[host_name("kernel_mul_mv_id_ext_iq4_nl_f32")]] kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4<block_iq4_nl, 8,  dequantize_iq4_nl_t4>>;
+
+template [[host_name("kernel_mul_mv_id_ext_q2_K_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4x4<block_q2_K, 16, dequantize_q2_K>>;
+template [[host_name("kernel_mul_mv_id_ext_q3_K_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4x4<block_q3_K, 16, dequantize_q3_K>>;
+template [[host_name("kernel_mul_mv_id_ext_q4_K_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4x4<block_q4_K, 16, dequantize_q4_K>>;
+template [[host_name("kernel_mul_mv_id_ext_q5_K_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4x4<block_q5_K, 16, dequantize_q5_K>>;
+template [[host_name("kernel_mul_mv_id_ext_q6_K_f32")]]   kernel kernel_mul_mv_id_ext_t kernel_mul_mv_id_ext<mul_mv_id_ext_q4x4<block_q6_K, 16, dequantize_q6_K>>;
+
 template<typename T0, typename T1, short NR0, typename args_t>
 void kernel_mul_mv_t_t_impl(
         args_t args,

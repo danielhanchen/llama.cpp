@@ -55,6 +55,9 @@ bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_t
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
+// few-token MUL_MAT_ID that reads each routed expert once for all of its tokens (kernel_mul_mv_id_ext)
+bool ggml_metal_op_mul_mat_id_use_mv_ext(const struct ggml_tensor * op);
+
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op); // graph structure only
 
