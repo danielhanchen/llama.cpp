@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -262,6 +263,7 @@ public:
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, const slot_info & sinfo, uint32_t kpool, uint32_t n_kv) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_cell_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // idx(i, j) = i*(extent + 1) + rel; out-of-band cells map to the zero column `extent`
     void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
@@ -474,6 +476,7 @@ public:
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, uint32_t kpool) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_cell_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
@@ -500,6 +503,11 @@ private:
 
     // the index of the cur ubatch to process
     size_t i_cur = 0;
+
+    // get_n_kv_pos_contiguous() of ubatch i_cur once applied: the check scans the cells of the sequence, and the
+    // graph build or reuse check and set_input each ask for it
+    mutable size_t   i_pos_contiguous = SIZE_MAX;
+    mutable uint32_t n_pos_contiguous = 0;
 
     slot_info_vec_t sinfos;
 
