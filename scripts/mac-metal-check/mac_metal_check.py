@@ -221,7 +221,7 @@ def parse_tbo(text):
     dev = sorted({l.strip()[:160] for l in lines
                   if re.search(r"GPU name|GPU family|simdgroup|has bfloat|has tensor|XPLAT_FORCE", l)})[:16]
     crash = [l.strip()[:200] for l in lines if re.search(r"GGML_ASSERT|GGML_ABORT|failed to compile pipeline|"
-                                                         r"Segmentation|Abort trap|libc\+\+abi", l)][:8]
+                                                         r"Segmentation|Abort trap|libc\+\+abi|: not implemented$", l)][:8]
     return {"n_ok": len(ok), "n_fail": max(len(fail), short), "n_unsup": len(unsup), "fail": fail[:60],
             "unsup": unsup[:30], "device": dev, "crash": crash,
             "ext_pipelines": sorted({m.group(1) for m in EXT_RE.finditer(text)})}
@@ -406,7 +406,11 @@ class Job:
                                                    read(self.work / f"tbo_{key}.log"), re.MULTILINE)}
             missing = [t for t in want if t not in got]
             r["fork_types_seen"] = sorted(got)
-            self.gate(f"pins_{key}", r["rc"] == 0 and r["n_fail"] == 0 and not r["crash"] and r["n_unsup"] > 0
+            # test-backend-ops exits 1 when a backend ran 0/0 tests, which is the expected result when Metal refuses
+            # every case; an abort exits on a signal (rc < 0), so it still fails
+            rc_ok = r["rc"] == 0 or (r["rc"] == 1 and r["n_ok"] == 0 and re.search(
+                r"^\s*0/0 tests passed", read(self.work / f"tbo_{key}.log"), re.MULTILINE) is not None)
+            self.gate(f"pins_{key}", rc_ok and r["n_fail"] == 0 and not r["crash"] and r["n_unsup"] > 0
                       and not missing,
                       f"ok={r['n_ok']} fail={r['n_fail']} unsup={r['n_unsup']} rc={r['rc']} missing={missing}")
 
