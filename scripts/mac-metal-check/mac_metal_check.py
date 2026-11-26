@@ -13,7 +13,9 @@ Parts (default: pins,model,bench, plus mvid with --add-commit):
   pins   mix build, test-backend-ops test -b MTL0 (Metal against CPU) for every op the pin set changes on Metal:
          FLASH_ATTN_EXT_BANDED, mixed K/V FLASH_ATTN_EXT, all FLASH_ATTN_EXT (shared launcher, skipped by --quick):
          rc 0, 0 FAIL, > 0 OK. Fork-only types (IQ1_XS/XXS/XXXS, MXFP8) for GET_ROWS / MUL_MAT / MUL_MAT_ID:
-         rc 0 and 0 FAIL (Metal has no kernels for them, so it must refuse them, not run them).
+         rc 0, 0 FAIL, no abort, > 0 "not supported", every expected type enumerated (all four for GET_ROWS,
+         the IQ1 three for MUL_MAT / MUL_MAT_ID; MXFP8 is gather-only). Metal has no kernels for them, so it must
+         refuse them (CPU fallback), not run them.
          On a GPU with the tensor API (M5) the FA ops are run again with GGML_METAL_TENSOR_DISABLE=1.
   model  tiny Inkling 2 (random weights, seed 42; the test fixture is widened to head size 128 so the banded Metal
          kernels engage), llama-perplexity -fa on per K/V type: CPU (-dev none) writes the reference, Metal
@@ -391,14 +393,22 @@ class Job:
                 r = self.tbo(key + "_notensor", b, op, filt, {"GGML_METAL_TENSOR_DISABLE": "1"})
                 self.gate(f"pins_{key}_notensor", r["rc"] == 0 and r["n_fail"] == 0 and r["n_ok"] > 0,
                           f"ok={r['n_ok']} fail={r['n_fail']}")
-        # fork-only quant types (pins #61, #332): no Metal kernels, so Metal must refuse them
-        for key, op, filt in (("fork_get_rows", "GET_ROWS", f"type={FORK_TYPES},"),
-                              ("fork_mul_mat", "MUL_MAT", f"type_a={FORK_TYPES},"),
-                              ("fork_mul_mat_id", "MUL_MAT_ID", f"type_a={FORK_TYPES},")):
+        # fork-only quant types (pins #61, #332): no Metal kernels, so Metal must refuse them. "not supported" is
+        # the expected verdict, so the gate also asserts every expected type was enumerated and reached a verdict
+        # (ok or not supported) without an abort; a filter matching no case, or a crash, cannot pass.
+        iq1 = ("iq1_xs", "iq1_xxs", "iq1_xxxs")
+        for key, op, filt, want in (("fork_get_rows", "GET_ROWS", f"type={FORK_TYPES},", iq1 + ("mxfp8",)),
+                                    ("fork_mul_mat", "MUL_MAT", f"type_a={FORK_TYPES},", iq1),    # MXFP8 is gather-only
+                                    ("fork_mul_mat_id", "MUL_MAT_ID", f"type_a={FORK_TYPES},", iq1)):
             r = self.tbo(key, b, op, filt)
-            seen = r["n_ok"] + r["n_fail"] + r["n_unsup"]          # a filter matching no case would pass vacuously
-            self.gate(f"pins_{key}", r["rc"] == 0 and r["n_fail"] == 0 and seen > 0,
-                      f"ok={r['n_ok']} fail={r['n_fail']} unsup={r['n_unsup']} rc={r['rc']}")
+            fld = "type" if op == "GET_ROWS" else "type_a"
+            got = {m.group(1) for m in re.finditer(rf"^  {op}\([^\n]*\b{fld}=(\w+),[^\n]*\): (?:OK|not supported)",
+                                                   read(self.work / f"tbo_{key}.log"), re.MULTILINE)}
+            missing = [t for t in want if t not in got]
+            r["fork_types_seen"] = sorted(got)
+            self.gate(f"pins_{key}", r["rc"] == 0 and r["n_fail"] == 0 and not r["crash"] and r["n_unsup"] > 0
+                      and not missing,
+                      f"ok={r['n_ok']} fail={r['n_fail']} unsup={r['n_unsup']} rc={r['rc']} missing={missing}")
 
     def tiny_model(self, b):
         mdir = self.work / "models"

@@ -7,7 +7,7 @@
 #
 # Everything lands in ./mac_metal_check_work (delete it afterwards). At the end it prints a summary and writes
 # mac_metal_check_<date>.tar.gz (result JSON + summary + logs) to attach or paste.
-# Env: TAG (upstream base tag, default b12722), MVID_COMMIT (<repo url>@<sha40>), MVID_ROUNDS (3), PARTS, WORK, JOBS,
+# Env: TAG (upstream base tag, default b12722), MVID_COMMIT (<repo url>@<sha40>), MVID_ROUNDS (3), PINSET_REF (unslothai/llama.cpp branch holding pr-set.json, default master), PARTS, WORK, JOBS,
 #      MAC_METAL_CI_HOOKS=1 (GitHub paravirtual runners only; never needed on a real Mac),
 #      MAC_METAL_CHECK_PY (path or URL of mac_metal_check.py, default: next to this script, else the fork branch).
 set -euo pipefail
@@ -56,6 +56,7 @@ esac
 
 ARGS=(--tag "$TAG" --work "$WORK" --out "$WORK/mac_metal_check.json" --jobs "$JOBS")
 [ "$MVID" = "1" ] && ARGS+=(--add-commit "$MVID_COMMIT")
+[ -n "${PINSET_REF:-}" ] && ARGS+=(--pinset-ref "$PINSET_REF")
 [ "${QUICK:-0}" = "1" ] && ARGS+=(--quick)
 [ "${MAC_METAL_CI_HOOKS:-0}" = "1" ] && ARGS+=(--ci-hooks)
 [ -n "${PARTS:-}" ] && ARGS+=(--parts "$PARTS")
