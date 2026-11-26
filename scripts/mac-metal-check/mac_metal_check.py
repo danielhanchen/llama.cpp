@@ -460,8 +460,12 @@ class Job:
 
     def part_mvid(self, b):
         a = self.a
-        new = self.tbo("mvid_eval", b, "MUL_MAT_ID")
-        old = self.tbo("mvid_eval_kill", b, "MUL_MAT_ID", a.mvid_eval_filter if a.quick else None, MVID_KILL)
+        # Fork-only types abort Metal in MUL_MAT_ID on the base mix too (the pins_fork_* gates own that); keep
+        # them out of the mvid gates so an abort there cannot hide the new kernel's verdict.
+        no_fork = f"^(?!.*type_a={FORK_TYPES},)"
+        kill_filt = no_fork + (f".*(?:{a.mvid_eval_filter})" if a.quick and a.mvid_eval_filter else "")
+        new = self.tbo("mvid_eval", b, "MUL_MAT_ID", no_fork)
+        old = self.tbo("mvid_eval_kill", b, "MUL_MAT_ID", kill_filt, MVID_KILL)
         self.gate("mvid_eval", new["rc"] == 0 and new["n_fail"] == 0 and new["n_ok"] > 0,
                   f"ok={new['n_ok']} fail={new['n_fail']} rc={new['rc']}")
         self.gate("mvid_engaged", len(new["ext_pipelines"]) > 0, f"{len(new['ext_pipelines'])} ext pipelines")
