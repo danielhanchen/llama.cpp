@@ -3260,6 +3260,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
         // reserve the banded path; the dense fallback is unallocatable at large n_ctx

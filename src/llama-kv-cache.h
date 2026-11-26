@@ -435,6 +435,7 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
     uint32_t get_n_kv_rows() const;
+    uint32_t get_size() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
