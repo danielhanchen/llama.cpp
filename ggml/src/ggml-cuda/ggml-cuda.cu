@@ -2606,6 +2606,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
         ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
 
+    // a thin F32 src0 with its own matrix per src1 channel at a few channels (e.g. per-token 2304x2 Inkling 2 loop
+    // controllers in a speculative verify batch): MMVF up to its batch size, where cuBLAS runs a batched GEMM of tiny
+    // products that costs 9x the single product. Decode (one channel) and prefill (many channels) keep their kernels.
+    if (src0->type == GGML_TYPE_F32 && ne01 <= 16 && ne02 == ne12 && ne03 == ne13 &&
+            ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE && ne11 <= MMVF_MAX_BATCH_SIZE &&
+            ggml_cuda_should_use_mmvf(src0, cc, warp_size, /*ne11 =*/ 1)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
         // The custom vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2651,6 +2660,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (src0->type == GGML_TYPE_F8_E4M3 && ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst)) {
+        return;
+    }
+    // a 2D src0 broadcast over a few src1 channels is one GEMM over all their columns: cuBLAS would otherwise run a
+    // batched GEMM of tiny products (e.g. the Inkling 2 relative-bias table in a speculative verify batch, 2.3x slower).
+    // Decode (one channel) and prefill (many channels) keep their kernels, so their results are unchanged.
+    if (ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 && ne12*ne13 <= MMVF_MAX_BATCH_SIZE &&
+            ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor src1_2d = *src1;
+        ggml_tensor dst_2d  = *dst;
+        src1_2d.ne[1] = ne11*ne12*ne13;
+        src1_2d.ne[2] = 1;
+        src1_2d.ne[3] = 1;
+        // contiguous: the rows are packed, whatever stride a size-1 dimension of a permuted view carries
+        src1_2d.nb[1] = ggml_row_size(src1->type, ne10);
+        src1_2d.nb[2] = src1_2d.nb[1]*src1_2d.ne[1];
+        src1_2d.nb[3] = src1_2d.nb[2];
+        dst_2d.ne[1]  = src1_2d.ne[1];
+        dst_2d.ne[2]  = 1;
+        dst_2d.ne[3]  = 1;
+        dst_2d.nb[1]  = ggml_row_size(dst->type, ne0);
+        dst_2d.nb[2]  = dst_2d.nb[1]*dst_2d.ne[1];
+        dst_2d.nb[3]  = dst_2d.nb[2];
+        dst_2d.src[1] = &src1_2d;
+        ggml_cuda_mul_mat_cublas(ctx, src0, &src1_2d, &dst_2d);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
