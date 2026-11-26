@@ -393,12 +393,16 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_k3(params);
         case LLM_ARCH_KIMI_K31:
             return new llama_model_kimi_k31(params);
+        case LLM_ARCH_RAON1_MINI:
+            return new llama_model_raon1_mini(params);
         case LLM_ARCH_GLM5_NEXT:
             return new llama_model_glm5_next(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
         case LLM_ARCH_SPARK2_5:
             return new llama_model_spark2_5(params);
+        case LLM_ARCH_INKLING:
+            return new llama_model_inkling(params);
         case LLM_ARCH_K2_HORIZON:
             return new llama_model_k2_horizon(params);
         case LLM_ARCH_KOLIBRI1:
@@ -1197,6 +1201,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_21B_A3B:       return "21B.A3B";
         case LLM_TYPE_24B_A2B:       return "24B.A2B";
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
+        case LLM_TYPE_29B_A4B:       return "29B.A4B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
         case LLM_TYPE_32B_A9B:       return "32B.A9B";
@@ -3523,6 +3528,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
+                    } else if (arch == LLM_ARCH_INKLING) {
+                        // all layers have both an attention KV cache and a recurrent (conv) state
+                        filter_attn = [&](uint32_t) { return true; };
+                        filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
                         filter_attn = [&](uint32_t il) {
                             return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
@@ -3895,6 +3904,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_KIMI_K31:
+        case LLM_ARCH_INKLING:
+        case LLM_ARCH_RAON1_MINI:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STARCODER:
         case LLM_ARCH_INKLING2:

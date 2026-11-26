@@ -306,10 +306,19 @@ class ModelBase:
                             data_gen = lambda data=data_torch: LazyTorchTensor.from_eager(data)  # noqa: E731
                         else:
                             data_gen = lambda data=data_torch: data  # noqa: E731
+                    # the index maps each tensor to one shard; a duplicate would silently overwrite it
+                    if weight_map and name in weight_map and weight_map[name] != part_name:
+                        raise ValueError(
+                            f"tensor '{name}' found in '{part_name}' but the index assigns "
+                            f"it to '{weight_map[name]}'; refusing to load a wrong-shard copy")
                     titem = self.filter_tensors((name, data_gen))
                     self._source_tensor_names[name] = titem[0] if titem else None
                     if titem:
                         tname, tgen = titem
+                        if tname in tensors:
+                            raise ValueError(
+                                f"duplicate tensor '{tname}' found in multiple model parts; "
+                                f"refusing to silently overwrite")
                         tensors[tname] = tgen
 
         # verify tensor name presence and identify potentially missing files
@@ -375,6 +384,20 @@ class ModelBase:
             self.gguf_writer.add_tensor(new_name, scale.flatten().numpy())
 
     def dequant_model(self):
+        # stacked-expert NVFP4 (w13_weight/w2_weight) is silently skipped by the NVFP4 repack and the dequant below
+        quant_config = self.hparams.get("quantization_config")
+        if isinstance(quant_config, dict) and quant_config.get("quant_method") in ("modelopt", "modelopt_mixed"):
+            stacked_expert_aux = [
+                n for n in self.model_tensors
+                if n.endswith((".scale2", ".input_amax", ".original_shape"))
+            ]
+            if stacked_expert_aux:
+                raise NotImplementedError(
+                    "This checkpoint stores quantized experts in the stacked ModelOpt NVFP4 layout "
+                    f"({len(stacked_expert_aux)} auxiliary tensors like {stacked_expert_aux[0]!r}), "
+                    "which is not supported yet. Convert from the unquantized (BF16) checkpoint instead."
+                )
+
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
         if self._is_nvfp4 and not any(k.endswith((".weight_scale", ".weight_scale_inv", ".input_scale", ".activation_scale", "_activation_scale", ".k_scale", ".v_scale")) for k in self.model_tensors):
             return
@@ -1721,6 +1744,14 @@ class ModelBase:
         self.prepare_tensors()
         if (self.ple_only or self.no_ple) and not self._has_ple:
             raise ValueError("model has no per-layer embedding table to export separately")
+        # zero tensors means the shards were never discovered, yet a metadata-only GGUF logs success
+        n_written = sum(len(shard) for shard in self.gguf_writer.tensors)
+        if n_written == 0:
+            raise ValueError(
+                "no tensors were written: the model shards could not be found. "
+                "Check that the safetensors filenames are discoverable (they must "
+                "start with 'model') or that model.safetensors exists."
+            )
         self.prepare_metadata(vocab_only=False)
         self.gguf_writer.write_header_to_file(path=self.fname_out)
         self.gguf_writer.write_kv_data_to_file()
@@ -2473,6 +2504,9 @@ class TextModel(ModelBase):
         if chkhsh == "32d85c31273f8019248f2559fed492d929ea28b17e51d81d3bb36fff23ca72b3":
             # ref: https://huggingface.co/domyn/Domyn-Edge-Teacher-IF
             res = "domyn-edge"
+        if chkhsh == "ffdae2f611dc6903980be2fbb108467cb97376d7d03cd332bb7e2602f87fa1f1":
+            # ref: https://huggingface.co/KRAFTON/Raon-1-mini-preview
+            res = "raon"
 
         if res is None:
             logger.warning("\n")

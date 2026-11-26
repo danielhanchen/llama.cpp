@@ -170,6 +170,7 @@ enum llm_arch {
     LLM_ARCH_KIMI_LINEAR,
     LLM_ARCH_KIMI_K3,
     LLM_ARCH_KIMI_K31,
+    LLM_ARCH_RAON1_MINI,
     LLM_ARCH_GLM5_NEXT,
     LLM_ARCH_TALKIE,
     LLM_ARCH_MELLUM,
@@ -177,6 +178,7 @@ enum llm_arch {
     LLM_ARCH_MINIMAX_M3,
     LLM_ARCH_DFLASH,
     LLM_ARCH_NANBEIGE,
+    LLM_ARCH_INKLING,
     LLM_ARCH_QWEN3TTS,
     LLM_ARCH_POCKETTTS,
     LLM_ARCH_MOSHI,
@@ -316,6 +318,7 @@ enum llm_kv {
     LLM_KV_ATTENTION_VALUE_LENGTH,
     LLM_KV_ATTENTION_LAYERNORM_EPS,
     LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,
+    LLM_KV_ATTENTION_LATENT_NORM_RMS_EPS,
     LLM_KV_ATTENTION_GROUPNORM_EPS,
     LLM_KV_ATTENTION_GROUPNORM_GROUPS,
     LLM_KV_ATTENTION_CAUSAL,
@@ -514,6 +517,17 @@ enum llm_kv {
 
     LLM_KV_SHORTCONV_L_CACHE,
 
+    // inkling (private arch)
+    LLM_KV_INKLING_D_REL,
+    LLM_KV_INKLING_REL_EXTENT,
+    LLM_KV_INKLING_REL_EXTENT_SWA,
+    LLM_KV_INKLING_SHORTCONV_KERNEL,
+    LLM_KV_INKLING_DENSE_BLOCK_COUNT,
+    LLM_KV_INKLING_LOGIT_SCALE_DENOM,
+    LLM_KV_INKLING_LOG_SCALING_N_FLOOR,
+    LLM_KV_INKLING_LOG_SCALING_ALPHA,
+    LLM_KV_INKLING_UNPADDED_VOCAB_SIZE,
+
     LLM_KV_DIFFUSION_CANVAS_LENGTH,
 
     LLM_KV_XIELU_ALPHA_N,
@@ -616,6 +630,10 @@ enum llm_tensor {
     LLM_TENSOR_FFN_DOWN_CHEXPS,
     LLM_TENSOR_FFN_GATE_CHEXPS,
     LLM_TENSOR_FFN_UP_CHEXPS,
+    // Inkling: same GGUF names as *_SHEXP but registered as MUL_MAT_ID (3D shared-expert bank via ggml_mul_mat_id)
+    LLM_TENSOR_FFN_DOWN_SHEXPS,
+    LLM_TENSOR_FFN_GATE_SHEXPS,
+    LLM_TENSOR_FFN_UP_SHEXPS,
     LLM_TENSOR_FFN_EXP_PROBS_B,
     LLM_TENSOR_FFN_EXP_PROBS_B_VL,
     LLM_TENSOR_FFN_LATENT_DOWN,
@@ -718,6 +736,7 @@ enum llm_tensor {
     LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A
     LLM_TENSOR_SSM_F_B,             // kimi: forget gate projection B
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
+    LLM_TENSOR_SSM_RDA,             // raon1_mini: write gate offset
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
     LLM_TENSOR_SSM_G,               // kimi-k3: full-rank KDA gate
@@ -887,6 +906,14 @@ enum llm_tensor {
     LLM_TENSOR_SHORTCONV_CONV,
     LLM_TENSOR_SHORTCONV_INPROJ,
     LLM_TENSOR_SHORTCONV_OUTPROJ,
+    // inkling (private arch)
+    LLM_TENSOR_ATTN_R,
+    LLM_TENSOR_ATTN_REL_PROJ,
+    LLM_TENSOR_SHORTCONV_K,
+    LLM_TENSOR_SHORTCONV_V,
+    LLM_TENSOR_SHORTCONV_ATTN,
+    LLM_TENSOR_SHORTCONV_MLP,
+    LLM_TENSOR_FFN_GSCALE,
     LLM_TENSOR_VISEXP_ATTN_QKV,
     LLM_TENSOR_VISEXP_ATTN_OUT,
     LLM_TENSOR_VISEXP_FFN_GATE,

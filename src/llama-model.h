@@ -130,6 +130,7 @@ enum llm_type {
     LLM_TYPE_21B_A3B, // Ernie MoE small
     LLM_TYPE_24B_A2B, // lfm2moe
     LLM_TYPE_26B_A4B, // Gemma4
+    LLM_TYPE_29B_A4B, // Raon-1 mini
     LLM_TYPE_30B_A3B,
     LLM_TYPE_31B_A3_5B,
     LLM_TYPE_32B_A9B, // Granite4 Hybrid
@@ -612,6 +613,7 @@ struct llama_layer {
     struct ggml_tensor * ssm_f_a    = nullptr;
     struct ggml_tensor * ssm_f_b    = nullptr;
     struct ggml_tensor * ssm_beta   = nullptr;
+    struct ggml_tensor * ssm_rda    = nullptr;
     struct ggml_tensor * ssm_g_a    = nullptr;
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
@@ -738,6 +740,15 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // inkling (private arch)
+    struct ggml_tensor * wr             = nullptr; // attn_r  [n_embd, n_head*d_rel]
+    struct ggml_tensor * attn_rel_proj  = nullptr; // [rel_extent, d_rel] (checkpoint [d_rel, E] orientation)
+    struct ggml_tensor * shortconv_k    = nullptr; // [K, kvw]
+    struct ggml_tensor * shortconv_v    = nullptr; // [K, kvw]
+    struct ggml_tensor * shortconv_attn = nullptr; // [K, n_embd]
+    struct ggml_tensor * shortconv_mlp  = nullptr; // [K, n_embd]
+    struct ggml_tensor * ffn_gscale     = nullptr; // F32 [1]
 };
 
 struct llama_device {

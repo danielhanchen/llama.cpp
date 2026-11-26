@@ -196,7 +196,7 @@ llama_context::llama_context(
             model.arch == LLM_ARCH_CLOVER_MOE ||
             // KDA
             model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
-            model.arch == LLM_ARCH_BAILINGMOE3);
+            model.arch == LLM_ARCH_BAILINGMOE3 || model.arch == LLM_ARCH_RAON1_MINI);
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -394,6 +394,11 @@ llama_context::llama_context(
             cparams.auto_fkvr = cparams.kv_unified;
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
+            cparams.auto_fkvr = false;
+        }
+
+        // the banded op and the kq_b fallback index the KQ mask by cell, not by kv_rows
+        if (model.arch == LLM_ARCH_INKLING) {
             cparams.auto_fkvr = false;
         }
     }
@@ -4489,6 +4494,13 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    // quantized V forces the dense path, which transposes V - invalid for a block-quantized tensor
+    if (model->arch == LLM_ARCH_INKLING && ggml_is_quantized(params.type_v)) {
+        LLAMA_LOG_ERROR("%s: model does not support a quantized V cache (%s)\n",
+            __func__, ggml_type_name(params.type_v));
         return nullptr;
     }
 

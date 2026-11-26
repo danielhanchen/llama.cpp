@@ -88,6 +88,7 @@ class TensorNameMap:
             "output_layer",              # chatglm
             "head",                      # rwkv
             "head.out",                  # wavtokenizer
+            "model.unembed",             # inkling
             "model.lm_head",             # dflash
             "model.transformer.ff_out",  # llada
             "head.decoder",              # modern-bert
@@ -719,6 +720,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.gate.e_score_correction",          # nemotron-h-moe
             "model.layers.{bid}.mlp.e_score_correction",                    # exaone-moe
             "model.layers.{bid}.block_sparse_moe.gate.e_score_correction",  # kimi
+            "model.layers.{bid}.moe.gate.e_score_correction",               # raon1_mini
             "model.layers.{bid}.moe.router_bias",                           # step3.5 expert selection bias
             "model.layers.{bid}.mlp.experts.e_score_correction",       # laguna
         ),
@@ -792,6 +794,7 @@ class TensorNameMap:
             "layers.{bid}.shared_experts.w3",                        # mistral-large
             "backbone.layers.{bid}.mixer.shared_experts.up_proj",    # nemotron-h-moe
             "model.layers.{bid}.block_sparse_moe.shared_experts.up_proj", # kimi
+            "model.layers.{bid}.moe.shared_experts.up_proj",              # raon1_mini
             "model.layers.{bid}.share_expert.up_proj",               # step3.5
         ),
 
@@ -845,6 +848,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.shared_mlp.gate_proj",             # hunyuan
             "layers.{bid}.shared_experts.w1",                          # mistral-large
             "model.layers.{bid}.block_sparse_moe.shared_experts.gate_proj", # kimi
+            "model.layers.{bid}.moe.shared_experts.gate_proj",              # raon1_mini
             "model.layers.{bid}.share_expert.gate_proj",               # step3.5
         ),
 
@@ -1027,6 +1031,7 @@ class TensorNameMap:
             "layers.{bid}.shared_experts.w2",                          # mistral-large
             "backbone.layers.{bid}.mixer.shared_experts.down_proj",    # nemotron-h-moe
             "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj", # kimi
+            "model.layers.{bid}.moe.shared_experts.down_proj",              # raon1_mini
             "model.layers.{bid}.share_expert.down_proj",               # step3.5
             "layers.{bid}.moe.shared_expert.down",                     # metis16
         ),
@@ -1288,6 +1293,10 @@ class TensorNameMap:
             "layers.{bid}.linear_attn.in_proj_b",        # qwen3.5 text
             "model.layers.{bid}.self_attn.b_proj",       # Kimi Linear
             "model.layers.{bid}.attention.b_proj",       # bailingmoe3
+        ),
+        # Raon-1 mini RDA: per-head write-gate offset
+        MODEL_TENSOR.SSM_RDA: (
+            "model.layers.{bid}.self_attn.rda_w_proj",
         ),
         # Kimi K3 latent MoE: routed experts operate in a down-projected space
         MODEL_TENSOR.FFN_ROUTED_DOWN: (
@@ -3427,6 +3436,53 @@ class TensorNameMap:
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
+        MODEL_ARCH.INKLING: {
+            MODEL_TENSOR.ATTN_NORM: (
+                "model.layers.{bid}.attn_norm",
+            ),
+            MODEL_TENSOR.ATTN_Q: (
+                "model.layers.{bid}.attn.wq_du",
+            ),
+            MODEL_TENSOR.ATTN_K: (
+                "model.layers.{bid}.attn.wk_dv",
+            ),
+            MODEL_TENSOR.ATTN_V: (
+                "model.layers.{bid}.attn.wv_dv",
+            ),
+            MODEL_TENSOR.ATTN_R: (
+                "model.layers.{bid}.attn.wr_du",
+            ),
+            MODEL_TENSOR.ATTN_OUT: (
+                "model.layers.{bid}.attn.wo_ud",
+            ),
+            MODEL_TENSOR.ATTN_Q_NORM: (
+                "model.layers.{bid}.attn.q_norm",
+            ),
+            MODEL_TENSOR.ATTN_K_NORM: (
+                "model.layers.{bid}.attn.k_norm",
+            ),
+            MODEL_TENSOR.ATTN_REL_PROJ: (
+                "model.layers.{bid}.attn.rel_logits_proj",
+            ),
+            MODEL_TENSOR.SHORTCONV_K: (
+                "model.layers.{bid}.attn.k_sconv",
+            ),
+            MODEL_TENSOR.SHORTCONV_V: (
+                "model.layers.{bid}.attn.v_sconv",
+            ),
+            MODEL_TENSOR.SHORTCONV_ATTN: (
+                "model.layers.{bid}.attn_sconv",
+            ),
+            MODEL_TENSOR.SHORTCONV_MLP: (
+                "model.layers.{bid}.mlp_sconv",
+            ),
+            MODEL_TENSOR.FFN_NORM: (
+                "model.layers.{bid}.mlp_norm",
+            ),
+            MODEL_TENSOR.FFN_DOWN: (
+                "model.layers.{bid}.mlp.w2_md",
+            ),
+        },
         MODEL_ARCH.ZAYA1: {
             MODEL_TENSOR.ATTN_Q:        ("model.layers.{bid}.self_attn.qkv_proj.q_proj",),
             MODEL_TENSOR.ATTN_K:        ("model.layers.{bid}.self_attn.qkv_proj.k_proj",),

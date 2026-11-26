@@ -300,6 +300,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_KIMI_K31
+            || arch == LLM_ARCH_RAON1_MINI
             || arch == LLM_ARCH_MISTRAL4
             || arch == LLM_ARCH_MISTRAL_LARGE4
             || arch == LLM_ARCH_HY_V4
@@ -386,7 +387,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_LFM3 ||
             arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_KIMI_K31 ||
-            arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_HY_V4_FLASH
+            arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_HY_V4_FLASH || arch == LLM_ARCH_RAON1_MINI
             ) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
@@ -398,7 +399,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
                     : (il == 1 ? 0 : n_head));
         }
         // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
-        if (arch == LLM_ARCH_GLM5_NEXT) {
+        if (arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_RAON1_MINI) {
             ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
             // the MLA cache holds one latent head
             for (uint32_t & n : n_head_per_layer) {
@@ -440,6 +441,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_KIMI_K31
+            || arch == LLM_ARCH_RAON1_MINI
             || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_HY_V4
             || arch == LLM_ARCH_HY_V4_FLASH
@@ -485,6 +487,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
+    ms.add_kv(LLM_KV_ATTENTION_LATENT_NORM_RMS_EPS,    1e-6f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) ? uint32_t(64) : uint32_t(512));
@@ -544,6 +547,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
 
     if (arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_LIMITE) {
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
+    }
+
+    if (arch == LLM_ARCH_RAON1_MINI) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE, 1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, true);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT, uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON, 1e-5f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE, 2.0f);
     }
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
@@ -898,6 +909,19 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   clamp_exp);
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, clamp_shexp);
     }
+    if (arch == LLM_ARCH_INKLING) {
+        // all required: load_arch_hparams asserts each is nonzero
+        ms.add_kv(LLM_KV_INKLING_D_REL,               uint32_t(16));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT,          uint32_t(8));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,      uint32_t(4));
+        ms.add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,    uint32_t(3));
+        ms.add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT,   uint32_t(1));
+        ms.add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM,   16.0f);
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_N_FLOOR, uint32_t(n_ctx));
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_ALPHA,   0.0f);
+        ms.add_kv(LLM_KV_INKLING_UNPADDED_VOCAB_SIZE, n_vocab);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        1.0f);
+    }
     if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
         // ISWA: the loader reads the SWA head lengths unconditionally, and they
         // are separate keys from the non-SWA pair above.
@@ -1186,6 +1210,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_INKLING:
         case LLM_ARCH_CLOVER_MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
@@ -1229,6 +1254,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_KIMI_K31:
+        case LLM_ARCH_RAON1_MINI:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
