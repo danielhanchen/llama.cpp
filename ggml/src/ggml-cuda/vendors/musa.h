@@ -83,6 +83,7 @@ typedef uint32_t ggml_cuda_thread_mask_t;
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyPeerAsync musaMemcpyPeerAsync
 #define cudaMemcpy2DAsync musaMemcpy2DAsync
+#define cudaMemcpyDefault musaMemcpyDefault
 #define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
