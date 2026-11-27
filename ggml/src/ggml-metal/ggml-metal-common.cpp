@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdlib>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -47,6 +48,51 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne21 = op->src[2]->ne[1];
 
     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
+}
+
+bool ggml_metal_op_mul_mat_id_use_mv_ext(const struct ggml_tensor * op) {
+    static const bool disabled = getenv("GGML_METAL_MUL_MV_ID_EXT_DISABLE") != nullptr;
+
+    if (disabled) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne21 = op->src[2]->ne[1]; // n_tokens
+
+    if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        src1->nb[0] != ggml_type_size(GGML_TYPE_F32) || ne00 % 128 != 0 || ne21 < 2 || ne21 > 8) {
+        return false;
+    }
+
+    // same type sets and row thresholds as the mul_mv_ext path of MUL_MAT
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return ne21 >= 4;
+        default:
+            return false;
+    }
 }
 
 // the most src1 rows of the few-row MMA kernels
