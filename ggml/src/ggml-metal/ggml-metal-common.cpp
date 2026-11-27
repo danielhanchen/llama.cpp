@@ -5,7 +5,11 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -50,6 +54,100 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
 }
 
+// the fewest tokens kernel_mul_mv_id_ext can be used from for a type (the thresholds of the mul_mv_ext path of
+// MUL_MAT), 0 if it has no instance for the type
+static int mul_mv_id_ext_min_tokens(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_IQ4_NL:
+            return 2;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+static bool mul_mv_id_ext_name_eq(const char * a, const std::string & b) {
+    return strlen(a) == b.size() && std::equal(b.begin(), b.end(), a, [](char x, char y) {
+        return tolower((unsigned char) x) == tolower((unsigned char) y);
+    });
+}
+
+// The types the kernel is used for. When few experts are shared by the tokens of the batch, the kernel runs the
+// generic mul_mv_ext dequantize + dot body once per entry, which is slower than the tuned kernel_mul_mv_<type> bodies
+// for most types (Q4_0 Q4_K Q2_K Q3_K NVFP4 F16 F32 measured 0.6-0.97x on an M5 Max). It wins where the
+// kernel_mul_mv_id body itself is weak:
+//  - Q8_0 (1.0-2.5x at 2..8 tokens in every measured shape): kernel_mul_mv_q8_0 does 2 rows per threadgroup and a
+//    threadgroup-memory reduction
+//  - Q5_K (Qwen3.6-35B-A3B down_exps, ne00 = 512): kernel_mul_mv_q5_K does 1 row per simdgroup and strides over 4
+//    super-blocks at a time, so with 2 super-blocks per row half of its lanes are idle
+// GGML_METAL_MUL_MV_ID_EXT_TYPES=<comma separated type names, e.g. q8_0,q4_K> or =all (every type with an instance)
+// replaces the default set
+static bool mul_mv_id_ext_type_enabled(ggml_type type) {
+    static const std::vector<bool> enabled = [] {
+        static const ggml_type types[] = {
+            GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+            GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+        };
+
+        std::vector<bool> res(GGML_TYPE_COUNT, false);
+
+        const char * env = getenv("GGML_METAL_MUL_MV_ID_EXT_TYPES");
+        if (env == nullptr) {
+            res[GGML_TYPE_Q8_0] = true;
+            res[GGML_TYPE_Q5_K] = true;
+            return res;
+        }
+
+        std::string list(env);
+        size_t pos = 0;
+        while (pos <= list.size()) {
+            size_t end = list.find(',', pos);
+            if (end == std::string::npos) {
+                end = list.size();
+            }
+            const std::string name = list.substr(pos, end - pos);
+            for (ggml_type t : types) {
+                if (name == "all" || mul_mv_id_ext_name_eq(ggml_type_name(t), name)) {
+                    res[t] = true;
+                }
+            }
+            pos = end + 1;
+        }
+
+        std::string used;
+        for (ggml_type t : types) {
+            if (res[t]) {
+                used += used.empty() ? "" : ",";
+                used += ggml_type_name(t);
+            }
+        }
+        GGML_LOG_INFO("ggml_metal: GGML_METAL_MUL_MV_ID_EXT_TYPES = '%s' -> kernel_mul_mv_id_ext types: %s\n", env,
+                used.empty() ? "none" : used.c_str());
+
+        return res;
+    }();
+
+    return enabled[type];
+}
+
 bool ggml_metal_op_mul_mat_id_use_mv_ext(const struct ggml_tensor * op) {
     static const bool disabled = getenv("GGML_METAL_MUL_MV_ID_EXT_DISABLE") != nullptr;
 
@@ -68,31 +166,9 @@ bool ggml_metal_op_mul_mat_id_use_mv_ext(const struct ggml_tensor * op) {
         return false;
     }
 
-    // same type sets and row thresholds as the mul_mv_ext path of MUL_MAT
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_Q2_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_NVFP4:
-        case GGML_TYPE_IQ4_NL:
-            return true;
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-            return ne21 >= 4;
-        default:
-            return false;
-    }
+    const int min_tokens = mul_mv_id_ext_min_tokens(src0->type);
+
+    return min_tokens > 0 && ne21 >= min_tokens && mul_mv_id_ext_type_enabled(src0->type);
 }
 
 // the most src1 rows of the few-row MMA kernels

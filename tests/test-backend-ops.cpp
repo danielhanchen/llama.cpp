@@ -14762,6 +14762,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.6-35B-A3B-like MoE (256 experts, top-8, gate / up 2048 -> 512, down 512 -> 2048), the K-quants of its
+    // UD-Q4_K_XL experts, at the token counts kernel_mul_mv_id_ext covers for K-quants
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int bs : {1, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id     (type_a, GGML_TYPE_F32, 256, 8, true,  512,  bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 256, 8, true,  512,  bs, 2048, 20));
+            test_cases.emplace_back(new test_mul_mat_id     (type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
+            test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512, 20));
+        }
+    }
+
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
